@@ -33,6 +33,7 @@ from tests.providers.support import (
     make_provider_config,
     profiled_provider,
     reasoning_for,
+    sdk_chat_chunk,
 )
 
 
@@ -43,8 +44,6 @@ def zenmux_provider() -> OpenAIChatProvider:
         make_provider_config(
             api_key="test-zenmux-key",
             base_url=ZENMUX_DEFAULT_BASE,
-            rate_limit=10,
-            rate_window=60,
         ),
         admission=immediate_admission(provider_name="zenmux"),
     )
@@ -89,7 +88,7 @@ def _chunk(
         tool_calls=None,
     )
     choice = SimpleNamespace(delta=delta, finish_reason=finish_reason)
-    return SimpleNamespace(choices=[choice], usage=None)
+    return sdk_chat_chunk(SimpleNamespace(choices=[choice], usage=None))
 
 
 def test_init_uses_documented_endpoint(
@@ -338,19 +337,24 @@ async def test_stream_preserves_signed_details_without_duplicating_reasoning(
         return_value=stream,
     ):
         event_text = "".join(
-            [event async for event in zenmux_provider.stream_messages(_request())]
+            [
+                frame
+                async for event in zenmux_provider.stream_messages(_request())
+                for frame in event.frames
+            ]
         )
 
     events = parse_sse_text(event_text)
     assert thinking_content(events) == "plan "
     assert text_content(events) == "done"
     records = [
-        decode_replay(event.data["delta"]["signature"]).native
+        event.data["delta"]["signature"]
         for event in events
         if event.data.get("delta", {}).get("type") == "signature_delta"
     ]
-    assert len(records) == 1
-    assert records[0]["reasoning_details"] == [detail]
+    assert [decode_replay(record).native for record in records] == [
+        {"reasoning_details": [detail]}
+    ]
     assert stream.closed
 
 
@@ -456,8 +460,6 @@ async def test_model_catalog_uses_documented_endpoint_and_auth() -> None:
             make_provider_config(
                 api_key="wire-zenmux-key",
                 base_url=ZENMUX_DEFAULT_BASE,
-                rate_limit=10,
-                rate_window=60,
             ),
             admission=immediate_admission(provider_name="zenmux"),
         )

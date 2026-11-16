@@ -10,7 +10,7 @@ from free_claude_code.core.anthropic import ReasoningReplayMode
 from free_claude_code.core.anthropic.conversion import AnthropicToOpenAIConverter
 from free_claude_code.core.anthropic.models import MessagesRequest
 from free_claude_code.core.history_replay import (
-    HistoryScope,
+    HistoryMode,
     ReplayOrigin,
     prepare_history,
 )
@@ -22,7 +22,11 @@ from free_claude_code.core.reasoning import ReasoningPolicy
 from free_claude_code.providers.deepseek.client import DeepSeekProvider
 from free_claude_code.providers.deepseek.compat import finalize_deepseek_chat_body
 from free_claude_code.providers.open_router import OpenRouterProvider
-from tests.providers.support import immediate_admission, make_provider_config
+from tests.providers.support import (
+    immediate_admission,
+    make_provider_config,
+    without_empty_reasoning,
+)
 
 
 def _chat(items):
@@ -63,26 +67,43 @@ def test_grouped_tool_calls_keep_both_reasoning_records():
         ]
     )
     assistant = messages[1]
-    assert assistant["reasoning_content"] == "first\nsecond"
-    assert [detail["data"] for detail in assistant["reasoning_details"]] == [
-        "opaque1",
-        "opaque2",
+    assert assistant["reasoning_details"] == [
+        {"type": "reasoning.text", "text": "first", "signature": "opaque1"},
+        {"type": "reasoning.text", "text": "second", "signature": "opaque2"},
     ]
 
 
-def test_quarantined_tool_call_does_not_donate_its_reasoning():
+def test_malformed_tool_call_keeps_its_reasoning_and_error_result():
     messages = _chat(
         [
             {"role": "user", "content": "continue"},
             _reasoning("broken call only", "opaque-broken"),
             _call("broken", "{"),
             _call("valid"),
+            {
+                "type": "function_call_output",
+                "call_id": "broken",
+                "output": "Invalid JSON",
+            },
             {"type": "function_call_output", "call_id": "valid", "output": "17"},
         ]
     )
     assistant = next(message for message in messages if message.get("tool_calls"))
-    assert not assistant.get("reasoning_content")
-    assert "reasoning_details" not in assistant
+    assert assistant["reasoning_details"] == [
+        {
+            "type": "reasoning.text",
+            "text": "broken call only",
+            "signature": "opaque-broken",
+        }
+    ]
+    assert [
+        (call["id"], call["function"]["arguments"]) for call in assistant["tool_calls"]
+    ] == [("broken", "{"), ("valid", "{}")]
+    assert [
+        (message["tool_call_id"], message["content"])
+        for message in messages
+        if message["role"] == "tool"
+    ] == [("broken", "Invalid JSON"), ("valid", "17")]
 
 
 def test_completed_hosted_tool_history_remains_readable():
@@ -256,7 +277,7 @@ def test_deepseek_off_to_on_preserves_effort_and_all_available_history(wire):
     assert request.model_dump() == original
 
 
-def test_summary_is_context_even_when_destination_replays_full_reasoning():
+def test_summary_uses_the_destination_readable_thinking_field():
     messages = _chat(
         [
             {"role": "user", "content": "first"},
@@ -270,8 +291,8 @@ def test_summary_is_context_even_when_destination_replays_full_reasoning():
             {"role": "user", "content": "continue"},
         ]
     )
-    assert "reasoning_content" not in messages[1]
-    assert "[Earlier reasoning summary]" in messages[1]["content"]
+    assert messages[1]["reasoning_content"] == "A summary, not the hidden chain."
+    assert "reasoning_details" not in messages[1]
 
 
 def test_image_tool_result_does_not_start_a_new_user_turn():
@@ -295,9 +316,11 @@ def test_image_tool_result_does_not_start_a_new_user_turn():
     body = prepare_history(
         {"messages": messages},
         ReplayOrigin("a", "chat", "", "", "m"),
-        scope=HistoryScope.TOOL_CONTINUATION,
+        scope=HistoryMode.CURRENT,
     )
-    assert body["messages"] == messages
+    assert without_empty_reasoning(body["messages"]) == without_empty_reasoning(
+        messages
+    )
 
 
 def test_messages_interleaved_reasoning_belongs_to_the_tool_group():
@@ -434,7 +457,7 @@ def test_destination_without_native_reasoning_keeps_readable_context(wire):
                     {"role": "assistant", "content": "17"},
                 ],
             ),
-            reasoning_replay=ReasoningReplayMode.DISABLED,
+            reasoning_replay=ReasoningReplayMode.REASONING_CONTENT,
         ).body
     else:
         request = MessagesRequest.model_validate(
@@ -453,9 +476,9 @@ def test_destination_without_native_reasoning_keeps_readable_context(wire):
         )
         body = {
             "messages": AnthropicToOpenAIConverter.convert_messages(
-                request.messages, reasoning_replay=ReasoningReplayMode.DISABLED
+                request.messages, reasoning_replay=ReasoningReplayMode.REASONING_CONTENT
             )
         }
     rendered = json.dumps(body)
-    assert "[Earlier reasoning]" in rendered
+    assert "[Earlier reasoning]" not in rendered
     assert "Preserve this thought." in rendered

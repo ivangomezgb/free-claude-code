@@ -1,30 +1,31 @@
 #!/bin/sh
 set -eu
 
-REPO_ARCHIVE_URL="https://github.com/Alishahryar1/free-claude-code/archive/refs/heads/main.zip"
-PYTHON_VERSION="3.14.0"
-MIN_UV_VERSION="0.12.13"
+# Filled from the selected release before installation; placeholders are for dry-run.
+PYTHON_VERSION="<release-python>"
+MIN_UV_VERSION="<release-uv-minimum>"
 CLAUDE_INSTALL_URL="https://claude.ai/install.sh"
 CODEX_INSTALL_URL="https://chatgpt.com/codex/install.sh"
 PI_INSTALL_URL="https://pi.dev/install.sh"
 OPENCODE_INSTALL_URL="https://opencode.ai/v2/install"
 HERMES_INSTALL_URL="https://hermes-agent.nousresearch.com/install.sh"
-DSH_VERSION="0.1.0-rc.8"
-DSH_PACKAGE="@deepseek-ai/dsh@$DSH_VERSION"
+MIN_DSH_VERSION="0.2.0-rc.2"
+DSH_PACKAGE="@deepseek-ai/dsh@latest"
 GROK_INSTALL_URL="https://x.ai/cli/install.sh"
 MUSE_INSTALL_URL="https://dev.meta.ai/install.sh"
+AGY_INSTALL_URL="https://antigravity.google/cli/install.sh"
+MIN_AGY_VERSION="1.5.9"
 RTK_VERSION="0.44.2"
+HEADROOM_PACKAGE="headroom-ai[mcp]==0.40.0"
 RTK_RELEASE_BASE_URL="https://github.com/rtk-ai/rtk/releases/download/v$RTK_VERSION"
 UV_INSTALL_URL="https://astral.sh/uv/install.sh"
-FCC_MACOS_BUNDLE_ID="io.github.alishahryar1.free-claude-code"
-FCC_MACOS_OWNER_FILE=".free-claude-code-owner"
 # Include retired entry points so updates reject older FCC processes before replacement.
-FCC_COMMANDS="fcc-desktop fcc-server fcc-claude fcc-codex fcc-pi fcc-opencode fcc-cline fcc-hermes fcc-dsh fcc-grok fcc-muse fcc-aider fcc-update fcc-init free-claude-code"
+FCC_COMMANDS="fcc-desktop fcc-server fcc-claude fcc-codex fcc-pi fcc-opencode fcc-cline fcc-hermes fcc-dsh fcc-grok fcc-muse fcc-aider fcc-agy fcc-doctor fcc-update fcc-init free-claude-code"
 
 dry_run=0
-voice_nim=0
+update_only=0
 voice_local=0
-voice_all=0
+fcc_install_version=${FCC_INSTALL_VERSION:-}
 install_claude=1
 install_codex=1
 install_pi=1
@@ -35,13 +36,32 @@ install_dsh=1
 install_grok=1
 install_muse=1
 install_aider=1
-enable_rtk=0
+install_agy=1
+enable_rtk_headroom=0
 torch_backend=""
 temporary_file=""
 temporary_binary=""
 tool_bin=""
 pi_available=0
 rtk_path=""
+headroom_path=""
+install_log=""
+install_log_warning=0
+install_report_started=0
+install_report=""
+pending_steps=""
+current_install_step=""
+install_step_outcome=Completed
+install_stage_number=0
+install_stage_count=0
+install_cancelled=0
+fcc_verified=0
+desktop_ready=0
+installer_path=$0
+# With a piped installer, $0 names the shell, which may be an existing binary.
+case "${installer_path##*/}" in
+    sh|-sh|bash|-bash|dash|ksh|zsh) installer_path="" ;;
+esac
 
 show_usage() {
     cat <<'USAGE'
@@ -50,19 +70,140 @@ Usage: install.sh [options]
 Installs or updates Free Claude Code and lets you choose which coding agents to install or verify.
 
 Options:
-  --voice-nim              Install NVIDIA NIM voice transcription support.
   --voice-local            Install local Whisper voice transcription support.
-  --voice-all              Install all voice transcription backends.
   --torch-backend VALUE    Use a uv PyTorch backend, such as cu130. Requires local voice.
-  --rtk                    Install and configure RTK for the selected coding agents.
+  --rtk-headroom           Install and configure RTK + Headroom token optimization.
+  --update                 Skip when FCC is already this release or newer.
   --dry-run                Print commands without running them.
   --help                   Show this help text.
 USAGE
 }
 
 fail() {
+    write_install_log "error: $*"
     printf 'error: %s\n' "$*" >&2
     exit 1
+}
+
+write_install_log() {
+    [ -n "$install_log" ] || return 0
+    if { printf '%s %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*" >>"$install_log"; } 2>/dev/null; then
+        return 0
+    fi
+    install_log=""
+    if [ "$install_log_warning" -eq 0 ]; then
+        install_log_warning=1
+        printf 'warning: Could not write the installer log. Installation will continue.\n' >&2
+    fi
+}
+
+initialize_install_log() {
+    [ "$dry_run" -eq 0 ] || return 0
+    log_timestamp=$(date '+%Y%m%d-%H%M%S' 2>/dev/null) || log_timestamp=unknown
+    install_log="${HOME:-}/.fcc/logs/install-$log_timestamp-$$.log"
+    if [ -n "${HOME:-}" ] && (umask 077; mkdir -p "$HOME/.fcc/logs" && set -C && : >"$install_log") 2>/dev/null; then
+        write_install_log "Starting Free Claude Code installer"
+    else
+        install_log=""
+        install_log_warning=1
+        printf 'warning: Could not create the installer log. Installation will continue.\n' >&2
+    fi
+}
+
+complete_install_step() {
+    [ -n "$current_install_step" ] || return 0
+    install_step_result="${1:-$install_step_outcome}: $current_install_step"
+    install_report="${install_report}${install_step_result}
+"
+    write_install_log "$install_step_result"
+    current_install_step=""
+}
+
+start_install_step() {
+    if [ "$dry_run" -eq 1 ]; then step "${2:-$1}"; return 0; fi
+    [ "$install_report_started" -eq 1 ] || return 0
+    complete_install_step
+    current_install_step=$1
+    install_step_outcome=Completed
+    install_newline='
+'
+    case "$pending_steps" in
+        "$1") pending_steps="" ;;
+        "$1$install_newline"*) pending_steps=${pending_steps#*'
+'} ;;
+    esac
+    write_install_log "Starting: $1"
+    if [ "$install_stage_count" -gt 0 ]; then
+        install_stage_number=$((install_stage_number + 1))
+        printf '\n[%s/%s] %s\n' "$install_stage_number" "$install_stage_count" "${2:-$1}"
+    fi
+}
+
+print_installer_retry() {
+    printf 'Retry: '
+    if [ -f "$installer_path" ]; then
+        if [ -n "$fcc_install_version" ]; then
+            printf 'FCC_INSTALL_VERSION='
+            shell_quote "$fcc_install_version"
+            printf ' '
+        fi
+        printf 'sh '
+        shell_quote "$installer_path"
+    else
+        installer_ref=main
+        [ -z "$fcc_install_version" ] || installer_ref="v$fcc_install_version"
+        printf "curl -fsSL 'https://raw.githubusercontent.com/Alishahryar1/free-claude-code/%s/scripts/install.sh' | " "$installer_ref"
+        if [ -n "$fcc_install_version" ]; then
+            printf 'FCC_INSTALL_VERSION='
+            shell_quote "$fcc_install_version"
+            printf ' '
+        fi
+        printf 'sh -s --'
+    fi
+    [ "$voice_local" -eq 0 ] || printf ' --voice-local'
+    if [ -n "$torch_backend" ]; then
+        printf ' --torch-backend '
+        shell_quote "$torch_backend"
+    fi
+    [ "$enable_rtk_headroom" -eq 0 ] || printf ' --rtk-headroom'
+    printf '\n'
+}
+
+finish_install() {
+    install_exit_code=$1
+    trap - EXIT
+    set +e
+    if [ "$install_report_started" -eq 1 ]; then
+        if [ "$install_cancelled" -eq 1 ]; then
+            complete_install_step Cancelled
+        elif [ "$install_exit_code" -ne 0 ]; then
+            complete_install_step Failed
+        else
+            complete_install_step
+        fi
+        if [ "$install_exit_code" -ne 0 ]; then
+            if [ "$install_cancelled" -eq 1 ]; then
+                printf '\nInstallation cancelled.\n'
+            else
+                printf '\nInstallation did not finish.\n'
+            fi
+            printf '%s' "$install_report"
+            if [ -n "$pending_steps" ]; then
+                printf '%s\n' "$pending_steps" | while IFS= read -r pending; do
+                    printf 'Not attempted: %s\n' "$pending"
+                done
+            fi
+            printf 'Completed changes have been kept. Rerun the installer to try again.\n'
+            print_installer_retry
+            if [ "$install_cancelled" -eq 0 ]; then
+                printf 'For help, include the terminal error and the installer log.\n'
+            fi
+        fi
+        [ -z "$install_log" ] || printf 'Installer log: %s\n' "$install_log"
+        if [ "$fcc_verified" -eq 1 ]; then show_installer_next_steps; fi
+    fi
+    cleanup
+    exit "$install_exit_code"
 }
 
 installer_is_interactive() {
@@ -71,7 +212,7 @@ installer_is_interactive() {
 
 prompt_yes_no() {
     question=$1
-    default_answer=${2:-yes}
+    default_answer=${2:-no}
     case "$default_answer" in
         yes) prompt='[Y/n]' ;;
         no) prompt='[y/N]' ;;
@@ -134,7 +275,7 @@ select_coding_agent() {
         printf '%s already installed; will verify.\n' "$2" >&4
         return 0
     fi
-    prompt_yes_no "Install $2 for $3?" "${4:-yes}"
+    prompt_yes_no "Install $2 for $3?"
 }
 
 choose_coding_agents() {
@@ -165,84 +306,57 @@ choose_coding_agents() {
             install_opencode=0
         fi
 
-        if [ "$install_cline" -eq 1 ]; then
-            cline_default=yes
-        else
-            cline_default=no
-        fi
-        if select_coding_agent cline "Cline CLI" fcc-cline "$cline_default"; then
+        if select_coding_agent cline "Cline CLI" fcc-cline; then
             install_cline=1
         else
             install_cline=0
         fi
 
-        if [ "$install_hermes" -eq 1 ]; then
-            hermes_default=yes
-        else
-            hermes_default=no
-        fi
-        if select_coding_agent hermes "Hermes Agent" fcc-hermes "$hermes_default"; then
+        if select_coding_agent hermes "Hermes Agent" fcc-hermes; then
             install_hermes=1
         else
             install_hermes=0
         fi
 
-        if [ "$install_dsh" -eq 1 ]; then
-            dsh_default=yes
-        else
-            dsh_default=no
-        fi
-        if select_coding_agent dsh "DeepSeek Harness" fcc-dsh "$dsh_default"; then
+        if select_coding_agent dsh "DeepSeek Harness" fcc-dsh; then
             install_dsh=1
         else
             install_dsh=0
         fi
 
-        if [ "$install_grok" -eq 1 ]; then
-            grok_default=yes
-        else
-            grok_default=no
-        fi
-        if select_coding_agent grok "Grok Build" fcc-grok "$grok_default"; then
+        if select_coding_agent grok "Grok Build" fcc-grok; then
             install_grok=1
         else
             install_grok=0
         fi
 
-        if [ "$install_muse" -eq 1 ]; then
-            muse_default=yes
-        else
-            muse_default=no
-        fi
-        if select_coding_agent muse "Muse Code" fcc-muse "$muse_default"; then
+        if select_coding_agent muse "Muse Code" fcc-muse; then
             install_muse=1
         else
             install_muse=0
         fi
 
-        if [ "$install_aider" -eq 1 ]; then
-            aider_default=yes
-        else
-            aider_default=no
-        fi
-        if select_coding_agent aider Aider fcc-aider "$aider_default"; then
+        if select_coding_agent aider Aider fcc-aider; then
             install_aider=1
         else
             install_aider=0
         fi
 
-        if [ "$install_claude" -eq 1 ] || [ "$install_codex" -eq 1 ] || [ "$install_pi" -eq 1 ] || [ "$install_opencode" -eq 1 ] || [ "$install_cline" -eq 1 ] || [ "$install_hermes" -eq 1 ] || [ "$install_dsh" -eq 1 ] || [ "$install_grok" -eq 1 ] || [ "$install_muse" -eq 1 ] || [ "$install_aider" -eq 1 ]; then
+        if select_coding_agent agy "Antigravity CLI" fcc-agy; then
+            install_agy=1
+        else
+            install_agy=0
+        fi
+
+        if [ "$install_claude" -eq 1 ] || [ "$install_codex" -eq 1 ] || [ "$install_pi" -eq 1 ] || [ "$install_opencode" -eq 1 ] || [ "$install_cline" -eq 1 ] || [ "$install_hermes" -eq 1 ] || [ "$install_dsh" -eq 1 ] || [ "$install_grok" -eq 1 ] || [ "$install_muse" -eq 1 ] || [ "$install_aider" -eq 1 ] || [ "$install_agy" -eq 1 ]; then
             break
         fi
         printf 'Select at least one coding agent.\n\n' >&4
     done
 
-    if [ "$enable_rtk" -eq 0 ]; then
-        if command -v rtk >/dev/null 2>&1; then
-            printf 'RTK already installed; will verify.\n' >&4
-            enable_rtk=1
-        elif prompt_yes_no "Enable RTK token optimization globally for the selected coding agents?" no; then
-            enable_rtk=1
+    if [ "$enable_rtk_headroom" -eq 0 ]; then
+        if prompt_yes_no "Enable RTK + Headroom token optimization?" no; then
+            enable_rtk_headroom=1
         fi
     fi
 
@@ -281,7 +395,10 @@ run() {
         return 0
     fi
 
+    run_started=$(date +%s)
+    write_install_log "$(print_command "$@")"
     if "$@"; then
+        write_install_log "Exit code 0 after $(($(date +%s) - run_started))s: $1"
         return 0
     else
         status=$?
@@ -299,9 +416,9 @@ cleanup() {
     fi
 }
 
-trap cleanup EXIT
-trap 'exit 130' INT
-trap 'exit 143' HUP TERM
+trap 'finish_install "$?"' EXIT
+trap 'install_cancelled=1; exit 130' INT
+trap 'install_cancelled=1; exit 143' HUP TERM
 
 add_path_entry() {
     [ -n "$1" ] || return 0
@@ -462,6 +579,8 @@ download_and_run() {
         fail "The downloaded $label installer was empty."
     fi
 
+    installer_started=$(date +%s)
+    write_install_log "$(print_command "$interpreter" "$temporary_file" "$@")"
     if [ "$non_interactive" -eq 1 ]; then
         printf '+ CODEX_NON_INTERACTIVE=1 '
         quote_arg "$interpreter"
@@ -488,6 +607,7 @@ download_and_run() {
         fi
     fi
 
+    write_install_log "$label installer completed after $(($(date +%s) - installer_started))s"
     rm -f "$temporary_file"
     temporary_file=""
 }
@@ -649,7 +769,10 @@ run_rtk_init() {
         return 0
     fi
 
+    rtk_started=$(date +%s)
+    write_install_log "$(print_command "$rtk_path" "$@")"
     if RTK_TELEMETRY_DISABLED=1 "$rtk_path" "$@"; then
+        write_install_log "RTK configuration completed after $(($(date +%s) - rtk_started))s"
         return 0
     else
         status=$?
@@ -669,7 +792,7 @@ ensure_rtk_claude_config_directory() {
 }
 
 configure_rtk_for_selected_agents() {
-    [ "$enable_rtk" -eq 1 ] || return 0
+    [ "$enable_rtk_headroom" -eq 1 ] || return 0
 
     step "Installing and configuring RTK token optimization"
     ensure_rtk
@@ -689,8 +812,44 @@ configure_rtk_for_selected_agents() {
     fi
 }
 
+ensure_headroom() {
+    if command -v headroom >/dev/null 2>&1; then
+        headroom_path=$(command -v headroom)
+        printf 'Headroom already found on PATH; verifying it without updating it.\n'
+    else
+        run uv tool install --python "$PYTHON_VERSION" "$HEADROOM_PACKAGE"
+        if [ "$dry_run" -eq 1 ]; then
+            headroom_path="<uv-tool-bin>/headroom"
+        else
+            add_uv_tool_bin_directory
+            headroom_path="$tool_bin/headroom"
+            [ -x "$headroom_path" ] || fail "Headroom installation did not create $headroom_path."
+        fi
+    fi
+    run "$headroom_path" --version
+    run "$headroom_path" mcp install --help
+}
+
+configure_headroom_for_selected_agents() {
+    # Headroom 0.40.0's OpenCode registrar uses the pre-v2 schema.
+    printf 'Headroom setup supports Claude Code, Codex, and Grok. Other selected agents are skipped.\n'
+    set --
+    [ "$install_claude" -eq 0 ] || set -- "$@" claude
+    [ "$install_codex" -eq 0 ] || set -- "$@" codex
+    [ "$install_grok" -eq 0 ] || set -- "$@" grok
+    if [ "$#" -eq 0 ]; then
+        printf 'Headroom registration skipped: no supported agents selected.\n'
+        return 0
+    fi
+    for headroom_agent in "$@"; do
+        # Upstream resolves the server executable from PATH.
+        run env "PATH=$(dirname "$headroom_path"):$PATH" "$headroom_path" mcp install --agent "$headroom_agent"
+    done
+}
+
 ensure_claude() {
     if command -v claude >/dev/null 2>&1; then
+        install_step_outcome=Reused
         printf 'Claude Code already found on PATH; verifying it.\n'
     else
         download_and_run "$CLAUDE_INSTALL_URL" bash "Claude Code"
@@ -702,6 +861,7 @@ ensure_claude() {
 
 ensure_codex() {
     if command -v codex >/dev/null 2>&1; then
+        install_step_outcome=Reused
         printf 'Codex already found on PATH; verifying it.\n'
     else
         download_and_run "$CODEX_INSTALL_URL" sh "Codex" 1
@@ -717,8 +877,10 @@ ensure_pi() {
     existing_pi_path=$(command -v pi 2>/dev/null || true)
 
     if [ "$dry_run" -eq 1 ] && command -v pi >/dev/null 2>&1; then
+        install_step_outcome=Reused
         printf 'Pi already found on PATH; verifying it.\n'
     elif pi_command_is_compatible; then
+        install_step_outcome=Reused
         printf 'Pi already found on PATH; verifying it.\n'
     else
         if [ -n "$existing_pi_path" ]; then
@@ -733,6 +895,7 @@ ensure_pi() {
                 { [ -n "$existing_pi_path" ] &&
                     [ "$current_pi_path" = "$existing_pi_path" ] &&
                     ! pi_command_is_compatible; }; then
+                install_step_outcome=Skipped
                 printf 'Pi was not installed; continuing without it.\n'
                 return 0
             fi
@@ -784,13 +947,85 @@ run_opencode_installer() {
     VERSION= bash "$@"
 }
 
+latest_opencode_v1() {
+    tags=$(curl -fsSL --max-time 10 "https://registry.npmjs.org/-/package/opencode-ai/dist-tags") ||
+        fail "Could not discover the latest OpenCode 1 release. Upgrade OpenCode manually, then rerun the installer."
+    latest=$(printf '%s' "$tags" | tr '\r\n' '  ' | tr ',{}' '\n' | sed -n 's/^[[:space:]]*"latest"[[:space:]]*:[[:space:]]*//p' | sed 's/[[:space:]]*$//')
+    version=$(printf '%s' "$latest" | sed -n 's/^"\(1\.[0-9][0-9]*\.[0-9][0-9]*\)"$/\1/p')
+    if [ "$latest" != "\"$version\"" ] ||
+        ! printf '%s\n' "$version" | grep -Eq '^1\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' ||
+        ! stable_version_is_supported "$version" "1.19.0"; then
+        fail "The OpenCode registry did not return one stable v1 release at or above 1.19.0. Upgrade OpenCode manually, then rerun the installer."
+    fi
+    printf '%s\n' "$version"
+}
+
+run_opencode_upgrade() {
+    opencode_upgrade_target=$1
+    assert_no_opencode_processes_running
+    opencode_saved_path=$PATH
+    if [ -n "${original_opencode_path:-}" ] && [ -n "${original_opencode_search_path:-}" ]; then
+        # Installer-added directories must not hide a failed upgrade behind another copy.
+        PATH=$original_opencode_search_path
+        export PATH
+    fi
+    print_command "$opencode_path" upgrade "$opencode_upgrade_target"
+    write_install_log "$(print_command "$opencode_path" upgrade "$opencode_upgrade_target")"
+    if VERSION= "$opencode_path" upgrade "$opencode_upgrade_target"; then
+        :
+    else
+        status=$?
+        fail "OpenCode upgrade $opencode_upgrade_target failed (exit code $status). Finish the official upgrade manually, then rerun the installer."
+    fi
+    hash -r 2>/dev/null || true
+    opencode_path=$(command -v opencode || true)
+    [ -n "$opencode_path" ] || fail "OpenCode is missing from PATH after upgrade $opencode_upgrade_target. Finish the official upgrade manually, then rerun the installer."
+    opencode_current=$(opencode_version "$opencode_path") ||
+        fail "Could not read OpenCode at $opencode_path after upgrade $opencode_upgrade_target. Finish the official upgrade manually, then rerun the installer."
+    PATH=$opencode_saved_path
+    export PATH
+    if [ "$opencode_upgrade_target" = --major ]; then
+        case "$opencode_current" in
+            2.*) ;;
+            *) fail "OpenCode upgrade --major left '$opencode_current' at $opencode_path. Finish the official upgrade manually, then rerun the installer." ;;
+        esac
+    fi
+}
+
+check_opencode_install() {
+    [ -n "${HOME:-}" ] || fail "HOME is required to install OpenCode."
+    opencode_native="$HOME/.opencode/bin/opencode"
+    opencode_path=${original_opencode_path:-$(command -v opencode || true)}
+    opencode_action=install
+    if [ -n "$opencode_path" ]; then
+        opencode_current=$(opencode_version "$opencode_path") ||
+            fail "Could not read OpenCode version at $opencode_path. Correct that installation, then rerun the installer."
+        case "$opencode_current" in
+            2.*) opencode_action=reuse ;;
+            1.*) opencode_action=upgrade ;;
+            *) fail "OpenCode at $opencode_path is not a recognized stable v1 or v2. Correct that installation, then rerun the installer. See https://opencode.ai/v2/docs/migrate-v1/" ;;
+        esac
+    fi
+    opencode_plugin=$(opencode_rtk_plugin) || return $?
+    if [ "$opencode_action" != reuse ] || [ -n "$opencode_plugin" ]; then
+        assert_no_opencode_processes_running
+    fi
+    if [ "$opencode_action" = install ]; then
+        for opencode_target in "$HOME/.opencode" "$HOME/.opencode/bin" "$opencode_native"; do
+            [ ! -L "$opencode_target" ] || fail "OpenCode installation path is linked: $opencode_target. Migrate it manually."
+        done
+    fi
+}
+
 ensure_opencode() {
     [ -n "${HOME:-}" ] || fail "HOME is required to install OpenCode."
     opencode_native="$HOME/.opencode/bin/opencode"
     opencode_path=${original_opencode_path:-$(command -v opencode || true)}
     if [ "$dry_run" -eq 1 ]; then
         print_command opencode --version
-        printf 'Install stable OpenCode 2 if absent, or migrate v1 at %s; external v1 requires manual upgrade.\n' "$opencode_native"
+        printf 'Install stable OpenCode 2 if absent; retain stable v2.\n'
+        printf 'For v1 below 1.19.0: discover latest stable v1 and run opencode upgrade <latest-v1>, then verify.\n'
+        printf 'For remaining stable v1 at or above 1.19.0: run opencode upgrade --major, then verify stable v2.\n'
         printf 'Check and back up the recognized old OpenCode RTK plugin if present.\n'
         if [ -z "$opencode_path" ]; then
             download_and_run "$OPENCODE_INSTALL_URL" bash "OpenCode"
@@ -798,27 +1033,8 @@ ensure_opencode() {
         return 0
     fi
 
-    opencode_install=1
-    if [ -n "$opencode_path" ]; then
-        opencode_current=$(opencode_version "$opencode_path") ||
-            fail "Could not read OpenCode version at $opencode_path. Correct that installation, then rerun the installer."
-        case "$opencode_current" in
-            2.*) opencode_install=0 ;;
-            1.*)
-                [ "$opencode_path" = "$opencode_native" ] ||
-                    fail "OpenCode 1 at $opencode_path requires manual migration. Remove it with its package manager (npm: npm uninstall -g opencode-ai), then rerun this installer. See https://opencode.ai/v2/docs/migrate-v1/"
-                ;;
-            *) fail "OpenCode at $opencode_path is not a recognized stable v1 or v2. Correct that installation, then rerun the installer. See https://opencode.ai/v2/docs/migrate-v1/" ;;
-        esac
-    fi
-    opencode_plugin=$(opencode_rtk_plugin) || return $?
-    if [ "$opencode_install" -eq 1 ] || [ -n "$opencode_plugin" ]; then
-        assert_no_opencode_processes_running
-    fi
-    if [ "$opencode_install" -eq 1 ]; then
-        for opencode_target in "$HOME/.opencode" "$HOME/.opencode/bin" "$opencode_native"; do
-            [ ! -L "$opencode_target" ] || fail "OpenCode installation path is linked: $opencode_target. Migrate it manually."
-        done
+    check_opencode_install
+    if [ "$opencode_action" = install ]; then
         download_and_run "$OPENCODE_INSTALL_URL" run_opencode_installer "OpenCode"
         add_known_bin_directories
         hash -r 2>/dev/null || true
@@ -827,6 +1043,24 @@ ensure_opencode() {
             2.*) ;;
             *) fail "The OpenCode installer did not install stable OpenCode 2. See https://opencode.ai/v2/docs/" ;;
         esac
+    elif [ "$opencode_action" = upgrade ]; then
+        if ! stable_version_is_supported "$opencode_current" "1.19.0"; then
+            opencode_v1_target=$(latest_opencode_v1) || return $?
+            run_opencode_upgrade "$opencode_v1_target"
+            case "$opencode_current" in
+                2.*) ;;
+                *)
+                    [ "${opencode_current%%+*}" = "$opencode_v1_target" ] ||
+                        fail "OpenCode upgrade $opencode_v1_target left '$opencode_current' at $opencode_path. Finish the official upgrade manually, then rerun the installer."
+                    ;;
+            esac
+        fi
+        case "$opencode_current" in
+            1.*) run_opencode_upgrade --major ;;
+        esac
+    fi
+    if [ "$opencode_action" = reuse ] && [ -z "$opencode_plugin" ]; then
+        install_step_outcome=Reused
     fi
     # Check the command selected after the installer's PATH additions.
     hash -r 2>/dev/null || true
@@ -835,7 +1069,7 @@ ensure_opencode() {
     opencode_current=$(opencode_version "$opencode_path") || fail "Could not verify OpenCode at $opencode_path."
     case "$opencode_current" in
         2.*) printf 'Verified OpenCode %s at %s.\n' "$opencode_current" "$opencode_path" ;;
-        *) fail "OpenCode at $opencode_path is not stable OpenCode 2. Correct PATH, then rerun the installer." ;;
+        *) fail "OpenCode at $opencode_path is not stable OpenCode 2 (found '$opencode_current'). Correct PATH or finish the official upgrade manually, then rerun the installer." ;;
     esac
     if [ -n "$opencode_plugin" ]; then
         opencode_plugin=$(opencode_rtk_plugin) || return $?
@@ -855,6 +1089,7 @@ ensure_cline() {
     add_npm_bin_directories
 
     if command -v cline >/dev/null 2>&1; then
+        install_step_outcome=Reused
         printf 'Cline already found on PATH; verifying it.\n'
     else
         command -v npm >/dev/null 2>&1 || fail "Cline installation requires npm. Install Node.js from https://nodejs.org/en/download, then rerun the installer."
@@ -893,6 +1128,7 @@ install_hermes() {
 
 ensure_hermes() {
     if command -v hermes >/dev/null 2>&1; then
+        install_step_outcome=Reused
         printf 'Hermes Agent already found on PATH; verifying it.\n'
     else
         install_hermes
@@ -909,13 +1145,48 @@ current_dsh_version() {
     fi
 
     version=$(printf '%s\n' "$output" | awk '
-        match($0, /[0-9]+\.[0-9]+\.[0-9]+-[0-9A-Za-z][0-9A-Za-z.-]*/) {
-            print substr($0, RSTART, RLENGTH)
-            exit
-        }
+        { sub(/^[[:space:]]*(dsh[[:space:]]+)?v?/, ""); sub(/[[:space:]]*$/, "") }
+        /^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$/ { print; exit }
     ')
     [ -n "$version" ] || return 1
     printf '%s\n' "$version"
+}
+
+dsh_version_is_supported() {
+    LC_ALL=C awk -v version="$1" -v minimum="$MIN_DSH_VERSION" '
+        function numeric(value) { return value ~ /^[0-9]+$/ }
+        function compare(left, right) {
+            if (left == right) return 0
+            if (numeric(left) && numeric(right)) {
+                if (length(left) != length(right)) return length(left) > length(right) ? 1 : -1
+            } else if (numeric(left) != numeric(right)) return numeric(left) ? -1 : 1
+            return ("x" left) > ("x" right) ? 1 : -1
+        }
+        BEGIN {
+            sub(/\+.*/, "", version)
+            dash = index(version, "-")
+            core = dash ? substr(version, 1, dash - 1) : version
+            count = dash ? split(substr(version, dash + 1), preview, ".") : 0
+            if (split(core, release, ".") != 3) exit 1
+            for (i = 1; i <= 3; i++) if (release[i] !~ /^(0|[1-9][0-9]*)$/) exit 1
+            for (i = 1; i <= count; i++) {
+                if (preview[i] !~ /^[0-9A-Za-z-]+$/ || preview[i] ~ /^0[0-9]+$/) exit 1
+            }
+            split(minimum, parts, "-")
+            split(parts[1], base, ".")
+            for (i = 1; i <= 3; i++) {
+                diff = compare(release[i], base[i])
+                if (diff) exit (diff < 0)
+            }
+            if (!count) exit 0
+            floorCount = split(parts[2], floor, ".")
+            for (i = 1; i <= count && i <= floorCount; i++) {
+                diff = compare(preview[i], floor[i])
+                if (diff) exit (diff < 0)
+            }
+            exit (count < floorCount)
+        }
+    '
 }
 
 current_node_version() {
@@ -972,8 +1243,8 @@ verify_dsh_command() {
     fi
 
     command -v dsh >/dev/null 2>&1 || fail "DeepSeek Harness was installed, but 'dsh' is not available on PATH."
-    version=$(current_dsh_version) || fail "DeepSeek Harness is present, but 'dsh --version' did not return its preview semantic version."
-    [ "$version" = "$DSH_VERSION" ] || fail "DeepSeek Harness $DSH_VERSION is required; found $version after installation."
+    version=$(current_dsh_version) || fail "DeepSeek Harness is present, but 'dsh --version' did not return a semantic version."
+    dsh_version_is_supported "$version" || fail "DeepSeek Harness requires >=$MIN_DSH_VERSION; found $version after installation."
     printf 'Verified DeepSeek Harness %s.\n' "$version"
 }
 
@@ -989,7 +1260,7 @@ ensure_dsh() {
     if [ "$dry_run" -eq 1 ]; then
         if command -v dsh >/dev/null 2>&1; then
             print_command dsh --version
-            printf 'The exact supported DeepSeek Harness preview will be preserved; another version will be replaced.\n'
+            printf 'DeepSeek Harness >=%s will be preserved; an older version will be upgraded to latest.\n' "$MIN_DSH_VERSION"
         else
             command -v node >/dev/null 2>&1 || fail "DeepSeek Harness requires Node.js ^22.19.0 or >=24.0.0 and npm. Install Node.js, then rerun the installer."
             command -v npm >/dev/null 2>&1 || fail "DeepSeek Harness requires npm. Install npm, then rerun the installer."
@@ -1001,12 +1272,13 @@ ensure_dsh() {
 
     require_dsh_toolchain
     if command -v dsh >/dev/null 2>&1; then
-        version=$(current_dsh_version) || fail "DeepSeek Harness is present, but 'dsh --version' did not return its preview semantic version."
-        if [ "$version" = "$DSH_VERSION" ]; then
-            printf 'DeepSeek Harness %s already matches the supported preview; leaving it unchanged.\n' "$version"
+        version=$(current_dsh_version) || fail "DeepSeek Harness is present, but 'dsh --version' did not return a semantic version."
+        if dsh_version_is_supported "$version"; then
+            install_step_outcome=Reused
+            printf 'DeepSeek Harness %s already satisfies >=%s; leaving it unchanged.\n' "$version" "$MIN_DSH_VERSION"
             return 0
         fi
-        printf 'DeepSeek Harness %s does not match %s; replacing it with the supported preview.\n' "$version" "$DSH_VERSION"
+        printf 'DeepSeek Harness requires >=%s; upgrading %s to latest.\n' "$MIN_DSH_VERSION" "$version"
     fi
 
     install_dsh_package
@@ -1020,6 +1292,7 @@ install_grok_build() {
 
 ensure_grok() {
     if command -v grok >/dev/null 2>&1; then
+        install_step_outcome=Reused
         printf 'Grok Build already found on PATH; verifying it.\n'
     else
         install_grok_build
@@ -1039,6 +1312,7 @@ install_muse_code() {
 
 ensure_muse() {
     if command -v muse >/dev/null 2>&1; then
+        install_step_outcome=Reused
         printf 'Muse Code already found on PATH; verifying it.\n'
     else
         install_muse_code
@@ -1057,6 +1331,7 @@ ensure_aider() {
     fi
 
     if command -v aider >/dev/null 2>&1; then
+        install_step_outcome=Reused
         printf 'Aider already found on PATH; verifying it.\n'
     else
         install_aider_cli
@@ -1065,58 +1340,106 @@ ensure_aider() {
     verify_command aider "Aider"
 }
 
+current_agy_version() {
+    output=$(agy --version) || return 1
+    version=$(printf '%s\n' "$output" | awk '
+        { sub(/^[[:space:]]*/, ""); sub(/[[:space:]]*$/, "") }
+        /^[0-9]+\.[0-9]+\.[0-9]+(\+[0-9A-Za-z.-]+)?$/ { print; exit }
+    ')
+    [ -n "$version" ] || return 1
+    printf '%s\n' "$version"
+}
+
+ensure_agy() {
+    add_known_bin_directories
+    if [ "$dry_run" -eq 1 ]; then
+        if command -v agy >/dev/null 2>&1; then
+            print_command agy --version
+            printf 'Antigravity CLI >=%s will be preserved; an older version will be upgraded with agy update.\n' "$MIN_AGY_VERSION"
+        else
+            download_and_run "$AGY_INSTALL_URL" bash "Antigravity CLI"
+            print_command agy --version
+        fi
+        return 0
+    fi
+    if command -v agy >/dev/null 2>&1; then
+        version=$(current_agy_version) || fail "Antigravity CLI is present, but 'agy --version' did not return a stable semantic version."
+        if stable_version_is_supported "$version" "$MIN_AGY_VERSION"; then
+            install_step_outcome=Reused
+            printf 'Antigravity CLI %s already satisfies >=%s; leaving it unchanged.\n' "$version" "$MIN_AGY_VERSION"
+            return 0
+        fi
+    fi
+    [ -z "$(fcc_process_ids agy)" ] || fail "Close Antigravity CLI before replacing its executable, then rerun the installer."
+    if command -v agy >/dev/null 2>&1; then
+        run agy update
+    else
+        download_and_run "$AGY_INSTALL_URL" bash "Antigravity CLI"
+        add_known_bin_directories
+    fi
+    command -v agy >/dev/null 2>&1 || fail "Antigravity CLI was installed, but 'agy' is not available on PATH."
+    version=$(current_agy_version) || fail "Antigravity CLI did not return a stable semantic version after installation."
+    stable_version_is_supported "$version" "$MIN_AGY_VERSION" || fail "Antigravity CLI requires >=$MIN_AGY_VERSION; found $version after installation."
+    printf 'Verified Antigravity CLI %s.\n' "$version"
+}
+
 ensure_selected_coding_agents() {
     if [ "$install_claude" -eq 1 ]; then
-        step "Ensuring Claude Code is installed"
+        start_install_step "Claude Code" "Ensuring Claude Code is installed"
         ensure_claude
     fi
 
     if [ "$install_codex" -eq 1 ]; then
-        step "Ensuring Codex is installed"
+        start_install_step "Codex" "Ensuring Codex is installed"
         ensure_codex
     fi
 
     if [ "$install_pi" -eq 1 ]; then
-        step "Checking or installing Pi"
+        start_install_step "Pi" "Checking or installing Pi"
         ensure_pi
     fi
 
     if [ "$install_opencode" -eq 1 ]; then
-        step "Ensuring OpenCode is installed"
+        start_install_step "OpenCode" "Ensuring OpenCode is installed"
         ensure_opencode
     fi
 
     if [ "$install_cline" -eq 1 ]; then
-        step "Ensuring Cline CLI is installed"
+        start_install_step "Cline" "Ensuring Cline CLI is installed"
         ensure_cline
     fi
 
     if [ "$install_hermes" -eq 1 ]; then
-        step "Ensuring Hermes Agent is installed"
+        start_install_step "Hermes" "Ensuring Hermes Agent is installed"
         ensure_hermes
     fi
 
     if [ "$install_dsh" -eq 1 ]; then
-        step "Ensuring DeepSeek Harness is installed"
+        start_install_step "DeepSeek Harness" "Ensuring DeepSeek Harness is installed"
         ensure_dsh
     fi
 
     if [ "$install_grok" -eq 1 ]; then
-        step "Ensuring Grok Build is installed"
+        start_install_step "Grok" "Ensuring Grok Build is installed"
         ensure_grok
     fi
 
     if [ "$install_muse" -eq 1 ]; then
-        step "Ensuring Muse Code is installed"
+        start_install_step "Muse" "Ensuring Muse Code is installed"
         ensure_muse
     fi
 
     if [ "$install_aider" -eq 1 ]; then
-        step "Ensuring Aider is installed"
+        start_install_step "Aider" "Ensuring Aider is installed"
         ensure_aider
     fi
 
-    if [ "$install_claude" -eq 0 ] && [ "$install_codex" -eq 0 ] && [ "$pi_available" -eq 0 ] && [ "$install_opencode" -eq 0 ] && [ "$install_cline" -eq 0 ] && [ "$install_hermes" -eq 0 ] && [ "$install_dsh" -eq 0 ] && [ "$install_grok" -eq 0 ] && [ "$install_muse" -eq 0 ] && [ "$install_aider" -eq 0 ]; then
+    if [ "$install_agy" -eq 1 ]; then
+        start_install_step "Antigravity CLI" "Ensuring Antigravity CLI is installed"
+        ensure_agy
+    fi
+
+    if [ "$install_claude" -eq 0 ] && [ "$install_codex" -eq 0 ] && [ "$pi_available" -eq 0 ] && [ "$install_opencode" -eq 0 ] && [ "$install_cline" -eq 0 ] && [ "$install_hermes" -eq 0 ] && [ "$install_dsh" -eq 0 ] && [ "$install_grok" -eq 0 ] && [ "$install_muse" -eq 0 ] && [ "$install_aider" -eq 0 ] && [ "$install_agy" -eq 0 ]; then
         fail "No selected coding agent was installed. Re-run the installer and choose at least one."
     fi
 }
@@ -1244,6 +1567,7 @@ ensure_uv() {
     if command -v uv >/dev/null 2>&1; then
         version=$(current_uv_version) || fail "uv is present, but 'uv --version' did not return a valid version."
         if stable_version_is_supported "$version" "$MIN_UV_VERSION"; then
+            install_step_outcome=Reused
             printf 'uv %s already satisfies >=%s; leaving it unchanged.\n' "$version" "$MIN_UV_VERSION"
             return 0
         fi
@@ -1261,14 +1585,8 @@ ensure_uv() {
 parse_args() {
     while [ "$#" -gt 0 ]; do
         case "$1" in
-            --voice-nim)
-                voice_nim=1
-                ;;
             --voice-local)
                 voice_local=1
-                ;;
-            --voice-all)
-                voice_all=1
                 ;;
             --torch-backend)
                 shift
@@ -1280,11 +1598,14 @@ parse_args() {
                 torch_backend=${1#*=}
                 [ -n "$torch_backend" ] || fail "--torch-backend requires a non-empty value."
                 ;;
-            --rtk)
-                enable_rtk=1
+            --rtk-headroom)
+                enable_rtk_headroom=1
                 ;;
             --dry-run)
                 dry_run=1
+                ;;
+            --update)
+                update_only=1
                 ;;
             --help|-h)
                 show_usage
@@ -1300,33 +1621,28 @@ parse_args() {
 }
 
 validate_args() {
-    include_local=$voice_local
-    if [ "$voice_all" -eq 1 ]; then
-        include_local=1
+    if [ -n "$fcc_install_version" ]; then
+        case "$fcc_install_version" in
+            *[!0-9.]*) fail "FCC_INSTALL_VERSION must be a canonical major.minor.patch release." ;;
+        esac
+        printf '%s\n' "$fcc_install_version" | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' ||
+            fail "FCC_INSTALL_VERSION must be a canonical major.minor.patch release."
     fi
-
-    if [ -n "$torch_backend" ] && [ "$include_local" -ne 1 ]; then
-        fail "--torch-backend requires --voice-local or --voice-all."
+    if [ -n "$torch_backend" ] && [ "$voice_local" -ne 1 ]; then
+        fail "--torch-backend requires --voice-local."
     fi
 }
 
 package_spec() {
-    include_nim=$voice_nim
-    include_local=$voice_local
-
-    if [ "$voice_all" -eq 1 ]; then
-        include_nim=1
-        include_local=1
-    fi
-
-    if [ "$include_nim" -eq 1 ] && [ "$include_local" -eq 1 ]; then
-        printf 'free-claude-code[voice,voice_local] @ %s' "$REPO_ARCHIVE_URL"
-    elif [ "$include_nim" -eq 1 ]; then
-        printf 'free-claude-code[voice] @ %s' "$REPO_ARCHIVE_URL"
-    elif [ "$include_local" -eq 1 ]; then
-        printf 'free-claude-code[voice_local] @ %s' "$REPO_ARCHIVE_URL"
+    if [ "$voice_local" -eq 1 ]; then
+        printf '%s' 'free-claude-code[voice_local]'
     else
-        printf 'free-claude-code @ %s' "$REPO_ARCHIVE_URL"
+        printf '%s' 'free-claude-code'
+    fi
+    if [ -n "$fcc_install_version" ]; then
+        printf '==%s' "$fcc_install_version"
+    elif [ "$dry_run" -eq 1 ]; then
+        printf '%s' '==<selected-release>'
     fi
 }
 
@@ -1334,30 +1650,38 @@ install_free_claude_code() {
     assert_no_fcc_processes_running
     spec=$(package_spec)
 
-    if [ -n "$torch_backend" ]; then
-        run uv tool install --force --refresh-package free-claude-code --python "$PYTHON_VERSION" --torch-backend "$torch_backend" "$spec"
+    set -- uv tool install --force --refresh-package free-claude-code
+    if [ "$(uname -s)" = "Darwin" ]; then
+        set -- env -u UV_PYTHON_PREFERENCE "$@" --managed-python --python "$PYTHON_VERSION+gil"
     else
-        run uv tool install --force --refresh-package free-claude-code --python "$PYTHON_VERSION" "$spec"
+        set -- "$@" --python "$PYTHON_VERSION"
     fi
+    if [ -n "$torch_backend" ]; then
+        set -- "$@" --torch-backend "$torch_backend"
+    fi
+    run "$@" "$spec"
 }
 
 configure_and_verify_free_claude_code() {
+    start_install_step "PATH configuration"
     run uv tool update-shell
 
     if [ "$dry_run" -eq 1 ]; then
         print_command uv tool dir --bin
-        printf '+ verify fcc-desktop, fcc-server, fcc-claude, fcc-codex, fcc-pi, fcc-opencode, fcc-cline, fcc-hermes, fcc-dsh, fcc-grok, fcc-muse, and fcc-aider in the uv tool bin directory\n'
+        printf '+ verify fcc-desktop, fcc-server, fcc-claude, fcc-codex, fcc-pi, fcc-opencode, fcc-cline, fcc-hermes, fcc-dsh, fcc-grok, fcc-muse, fcc-aider, and fcc-agy in the uv tool bin directory\n'
         print_command fcc-server --version
         return 0
     fi
 
     add_uv_tool_bin_directory
+    start_install_step "FCC verification"
 
-    for command_name in fcc-desktop fcc-server fcc-claude fcc-codex fcc-pi fcc-opencode fcc-cline fcc-hermes fcc-dsh fcc-grok fcc-muse fcc-aider fcc-update; do
+    for command_name in fcc-desktop fcc-server fcc-claude fcc-codex fcc-pi fcc-opencode fcc-cline fcc-hermes fcc-dsh fcc-grok fcc-muse fcc-aider fcc-agy fcc-doctor fcc-update; do
         [ -x "$tool_bin/$command_name" ] || fail "Free Claude Code installation did not create $tool_bin/$command_name."
     done
 
     run "$tool_bin/fcc-server" --version
+    fcc_verified=1
 }
 
 shell_quote() {
@@ -1365,94 +1689,198 @@ shell_quote() {
     printf "'%s'" "$escaped"
 }
 
-macos_app_is_fcc_owned() {
-    app_dir=$1
-    owner_file="$app_dir/Contents/$FCC_MACOS_OWNER_FILE"
-    [ -d "$app_dir" ] &&
-        [ ! -L "$app_dir" ] &&
-        [ -f "$owner_file" ] &&
-        [ "$(cat "$owner_file")" = "$FCC_MACOS_BUNDLE_ID" ]
-}
-
 install_macos_desktop_app() {
     [ "$(uname -s)" = "Darwin" ] || return 0
-
-    app_dir="$HOME/Applications/Free Claude Code.app"
-    contents_dir="$app_dir/Contents"
-    owner_file="$contents_dir/$FCC_MACOS_OWNER_FILE"
-    executable_dir="$contents_dir/MacOS"
-    executable_path="$executable_dir/fcc-desktop"
-    resources_dir="$contents_dir/Resources"
-    icon_path="$resources_dir/AppIcon.icns"
-    desktop_dir="$HOME/Desktop"
-    desktop_link="$desktop_dir/Free Claude Code.app"
-
-    if [ -e "$app_dir" ] || [ -L "$app_dir" ]; then
-        macos_app_is_fcc_owned "$app_dir" ||
-            fail "An app not managed by Free Claude Code already exists at $app_dir. Move it, then rerun the installer."
-    fi
-
     if [ "$dry_run" -eq 1 ]; then
-        print_command mkdir -p "$executable_dir" "$resources_dir" "$desktop_dir"
-        print_command fcc-desktop --export-icon "$icon_path"
-        printf '+ write %s, %s, and %s\n' "$owner_file" "$contents_dir/Info.plist" "$executable_path"
-        print_command ln -s "$app_dir" "$desktop_link"
+        print_command fcc-desktop --install-macos-app
         return 0
     fi
+    run "$tool_bin/fcc-desktop" --install-macos-app
+}
 
-    mkdir -p "$executable_dir" "$resources_dir" "$desktop_dir"
-    run "$tool_bin/fcc-desktop" --export-icon "$icon_path"
-    [ -f "$icon_path" ] || fail "Free Claude Code did not export its macOS app icon to $icon_path."
-    printf '%s\n' "$FCC_MACOS_BUNDLE_ID" > "$owner_file"
-    cat > "$contents_dir/Info.plist" <<'PLIST'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>CFBundleDisplayName</key>
-    <string>Free Claude Code</string>
-    <key>CFBundleExecutable</key>
-    <string>fcc-desktop</string>
-    <key>CFBundleIdentifier</key>
-    <string>io.github.alishahryar1.free-claude-code</string>
-    <key>CFBundleIconFile</key>
-    <string>AppIcon</string>
-    <key>CFBundleName</key>
-    <string>Free Claude Code</string>
-    <key>CFBundlePackageType</key>
-    <string>APPL</string>
-    <key>LSMultipleInstancesProhibited</key>
-    <true/>
-    <key>LSUIElement</key>
-    <true/>
-</dict>
-</plist>
-PLIST
-    desktop_command=$(shell_quote "$tool_bin/fcc-desktop")
-    {
-        printf '%s\n' '#!/bin/sh'
-        printf 'exec %s\n' "$desktop_command"
-    } > "$executable_path"
-    chmod +x "$executable_path"
-
-    if [ -L "$desktop_link" ]; then
-        if [ "$(readlink "$desktop_link")" = "$app_dir" ]; then
-            rm -f "$desktop_link"
-        else
-            printf 'A non-FCC link already exists at %s; leaving it unchanged.\n' "$desktop_link"
-            return 0
-        fi
-    elif [ -e "$desktop_link" ]; then
-        printf 'A non-FCC item already exists at %s; leaving it unchanged.\n' "$desktop_link"
-        return 0
+show_installer_next_steps() {
+    if [ "$desktop_ready" -eq 1 ]; then
+        printf '\nFree Claude Code is installed and verified. Open Free Claude Code from Applications or the desktop to run it in the background.\n'
+        printf 'For terminal use, start the proxy with: fcc-server\n'
+    else
+        printf '\nFree Claude Code is installed and verified. Start the proxy with: fcc-server\n'
     fi
-    ln -s "$app_dir" "$desktop_link"
+    if [ "$install_claude" -eq 1 ]; then
+        printf 'Run Claude Code with: fcc-claude\n'
+    fi
+    if [ "$install_codex" -eq 1 ]; then
+        printf 'Run Codex with: fcc-codex\n'
+    fi
+    if [ "$pi_available" -eq 1 ]; then
+        printf 'Run Pi with: fcc-pi\n'
+    fi
+    if [ "$install_opencode" -eq 1 ]; then
+        printf 'Run OpenCode with: fcc-opencode\n'
+    fi
+    if [ "$install_cline" -eq 1 ]; then
+        printf 'Run Cline with: fcc-cline\n'
+    fi
+    if [ "$install_hermes" -eq 1 ]; then
+        printf 'Run Hermes Agent with: fcc-hermes\n'
+    fi
+    if [ "$install_dsh" -eq 1 ]; then
+        printf 'Run DeepSeek Harness with: fcc-dsh\n'
+    fi
+    if [ "$install_grok" -eq 1 ]; then
+        printf 'Run Grok Build with: fcc-grok\n'
+    fi
+    if [ "$install_muse" -eq 1 ]; then
+        printf 'Run Muse Code with: fcc-muse\n'
+    fi
+    if [ "$install_aider" -eq 1 ]; then
+        printf 'Run Aider with: fcc-aider\n'
+    fi
+    if [ "$install_agy" -eq 1 ]; then
+        printf 'Run Antigravity CLI with: fcc-agy\n'
+    fi
+}
+
+installed_fcc_version() {
+    # Look where uv usually lives without changing the PATH the installer preserves.
+    listing=$(
+        add_known_bin_directories
+        command -v uv >/dev/null 2>&1 || exit 1
+        uv tool list 2>/dev/null
+    ) || return 1
+    version=$(printf '%s\n' "$listing" | awk '$1 == "free-claude-code" && $2 ~ /^v/ { print substr($2, 2); exit }')
+    [ -n "$version" ] || return 1
+    printf '%s\n' "$version"
+}
+
+compare_fcc_versions() {
+    # Prints older, current, or newer for an installed version against a release.
+    printf '%s %s\n' "$1" "$2" | awk '
+        function parse(value, parts) {
+            if (!match(value, /^[0-9]+[.][0-9]+[.][0-9]+/)) return 0
+            split(substr(value, 1, RLENGTH), parts, ".")
+            parts[4] = substr(value, RLENGTH + 1)
+            return 1
+        }
+        {
+            if (!parse($1, installed) || !parse($2, release) || release[4] != "") exit 1
+            for (i = 1; i <= 3; i++) {
+                if (installed[i] + 0 > release[i] + 0) { print "newer"; exit }
+                if (installed[i] + 0 < release[i] + 0) { print "older"; exit }
+            }
+            # Local and post builds follow the release; dev and pre-releases precede it.
+            if (installed[4] == "") print "current"
+            else if (installed[4] ~ /^([+]|[.]post)/) print "newer"
+            else print "older"
+        }
+    '
+}
+
+fcc_update_is_needed() {
+    installed=$(installed_fcc_version) || return 0
+    comparison=$(compare_fcc_versions "$installed" "$fcc_install_version") || return 0
+    case "$comparison" in
+        current)
+            printf 'FCC %s is already up to date.\n' "$installed"
+            return 1
+            ;;
+        newer)
+            printf 'FCC %s is newer than the published version %s. No update needed.\n' "$installed" "$fcc_install_version"
+            return 1
+            ;;
+    esac
+    printf 'FCC update available: %s -> %s.\n' "$installed" "$fcc_install_version"
+}
+
+dispatch_release() {
+    release_base="https://github.com/Alishahryar1/free-claude-code/releases"
+    if [ -z "$fcc_install_version" ]; then
+        selected_url=$(curl -fsSL --max-time 10 --max-redirs 5 -o /dev/null -w '%{url_effective}' "$release_base/latest") ||
+            fail "Could not resolve the latest completed FCC release."
+        case "$selected_url" in
+            "$release_base/tag/v"[0-9]*) fcc_install_version=${selected_url#"$release_base/tag/v"} ;;
+            *) fail "GitHub returned an unexpected FCC release URL." ;;
+        esac
+        validate_args
+    fi
+    if ! selected_installer=$(curl -fsSL --max-time 10 --max-redirs 5 "https://raw.githubusercontent.com/Alishahryar1/free-claude-code/v$fcc_install_version/scripts/install.sh") ||
+        [ -z "$selected_installer" ] || ! sh -n -c "$selected_installer"; then
+        print_installer_retry >&2
+        fail "Could not load the installer for FCC $fcc_install_version."
+    fi
+    FCC_INSTALL_VERSION=$fcc_install_version _FCC_INSTALLER_RELEASE=$fcc_install_version exec sh -c "$selected_installer" sh "$@"
+}
+
+parse_toolchain_requirements() {
+    # Only the two supported scalar requirements in our own pyproject schema.
+    awk -v single_quote="'" '
+        BEGIN { number = "(0|[1-9][0-9]*)"; version = number "[.]" number "[.]" number }
+        {
+            line = $0
+            sub(/^[ \t]+/, "", line)
+            sub(/[ \t\r]+$/, "", line)
+            if (line ~ /^\[/) {
+                section = ""
+                if (line ~ /^\[project\][ \t]*(#.*)?$/) section = "project"
+                if (line ~ /^\[tool\.uv\][ \t]*(#.*)?$/) section = "uv"
+                if (section != "" && ++sections[section] != 1) invalid = 1
+                next
+            }
+            if ((section == "project" && line ~ /^requires-python[ \t]*=/) ||
+                (section == "uv" && line ~ /^required-version[ \t]*=/)) {
+                if (++keys[section] != 1) invalid = 1
+                sub(/^[^=]*=[ \t]*/, "", line)
+                quote = substr(line, 1, 1)
+                operator = section == "project" ? "==" : ">="
+                if ((quote != "\"" && quote != single_quote) ||
+                    line !~ ("^" quote operator version quote "[ \t]*(#.*)?$")) {
+                    invalid = 1
+                    next
+                }
+                value = substr(line, 4)
+                sub(quote ".*$", "", value)
+                values[section] = value
+            }
+        }
+        END {
+            if (invalid || keys["project"] != 1 || keys["uv"] != 1) exit 1
+            print values["project"], values["uv"]
+        }
+    '
+}
+
+load_toolchain() {
+    metadata_url="https://raw.githubusercontent.com/Alishahryar1/free-claude-code/v$fcc_install_version/pyproject.toml"
+    if ! toolchain_text=$(curl -fsSL --max-time 10 --max-redirs 5 "$metadata_url"); then
+        print_installer_retry >&2
+        fail "Could not fetch toolchain requirements for FCC $fcc_install_version."
+    fi
+    if ! toolchain_versions=$(printf '%s\n' "$toolchain_text" | parse_toolchain_requirements); then
+        print_installer_retry >&2
+        fail "Invalid Python or uv requirement in FCC $fcc_install_version pyproject.toml."
+    fi
+    PYTHON_VERSION=${toolchain_versions%% *}
+    MIN_UV_VERSION=${toolchain_versions#* }
 }
 
 parse_args "$@"
 validate_args
+if [ "$dry_run" -eq 0 ]; then
+    # Consume this invocation's handoff before any prerequisite processes run.
+    installer_release=${_FCC_INSTALLER_RELEASE:-}
+    [ -z "$installer_release" ] || [ "$installer_release" = "$fcc_install_version" ] || fail "Invalid FCC release handoff."
+    unset _FCC_INSTALLER_RELEASE
+    [ -n "$installer_release" ] || dispatch_release "$@"
+    if [ "$update_only" -eq 1 ] && ! fcc_update_is_needed; then
+        exit 0
+    fi
+    load_toolchain
+fi
+initialize_install_log
+if [ "$dry_run" -eq 0 ]; then install_report_started=1; fi
+start_install_step Preflight
 # Preserve the user's winning command before adding installer search paths.
 original_opencode_path=$(command -v opencode || true)
+original_opencode_search_path=$PATH
 add_known_bin_directories
 if command -v cline >/dev/null 2>&1 || command -v npm >/dev/null 2>&1; then
     install_cline=1
@@ -1476,14 +1904,43 @@ if installer_is_interactive; then
     choose_coding_agents /dev/tty /dev/tty
 fi
 
+pending_steps=$(
+    [ "$install_claude" -eq 0 ] || printf 'Claude Code\n'
+    [ "$install_codex" -eq 0 ] || printf 'Codex\n'
+    [ "$install_pi" -eq 0 ] || printf 'Pi\n'
+    [ "$install_opencode" -eq 0 ] || printf 'OpenCode\n'
+    [ "$install_cline" -eq 0 ] || printf 'Cline\n'
+    [ "$install_hermes" -eq 0 ] || printf 'Hermes\n'
+    [ "$install_dsh" -eq 0 ] || printf 'DeepSeek Harness\n'
+    [ "$install_grok" -eq 0 ] || printf 'Grok\n'
+    [ "$install_muse" -eq 0 ] || printf 'Muse\n'
+    [ "$install_aider" -eq 0 ] || printf 'Aider\n'
+    [ "$install_agy" -eq 0 ] || printf 'Antigravity CLI\n'
+)
+printf '\nInstallation plan:\n  Install or update Free Claude Code.\n  Verify or install: '
+printf '%s\n' "$pending_steps" | while IFS= read -r agent; do
+    printf '%s%s' "${separator:-}" "$agent"
+    separator=', '
+done
+printf '\n'
+[ "$voice_local" -eq 0 ] || printf '  Include local voice support.\n'
+[ -z "$torch_backend" ] || printf '  PyTorch backend: %s\n' "$torch_backend"
+[ "$enable_rtk_headroom" -eq 0 ] || printf '  Run RTK + Headroom setup for supported selected agents.\n'
+printf 'Press Ctrl+C to cancel. You can rerun the installer afterward.\n'
+pending_steps=$(printf 'uv\n%s\nFCC package\nPATH configuration\nFCC verification\n' "$pending_steps"
+    [ "$(uname -s)" != Darwin ] || printf 'Desktop integration\n'
+    [ "$enable_rtk_headroom" -eq 0 ] || printf 'Headroom verification\nRTK configuration\nHeadroom configuration\n'
+)
+install_stage_count=$(printf '%s\n' "$pending_steps" | wc -l)
+
 step "Checking installation prerequisites"
 require_command curl
-if [ "$install_claude" -eq 1 ] || [ "$install_opencode" -eq 1 ] || [ "$install_hermes" -eq 1 ] || [ "$install_grok" -eq 1 ] || [ "$install_muse" -eq 1 ]; then
+if [ "$install_claude" -eq 1 ] || [ "$install_opencode" -eq 1 ] || [ "$install_hermes" -eq 1 ] || [ "$install_grok" -eq 1 ] || [ "$install_muse" -eq 1 ] || [ "$install_agy" -eq 1 ]; then
     require_command bash
 fi
 require_command sh
 require_command mktemp
-if [ "$enable_rtk" -eq 1 ] && ! command -v rtk >/dev/null 2>&1; then
+if [ "$enable_rtk_headroom" -eq 1 ] && ! command -v rtk >/dev/null 2>&1; then
     require_command tar
     if [ "$dry_run" -eq 0 ] &&
         ! command -v sha256sum >/dev/null 2>&1 &&
@@ -1492,72 +1949,44 @@ if [ "$enable_rtk" -eq 1 ] && ! command -v rtk >/dev/null 2>&1; then
     fi
 fi
 
-step "Ensuring uv $MIN_UV_VERSION or newer is installed"
+if [ "$dry_run" -eq 0 ]; then
+    # Pi can bootstrap Node/npm before the dependent agents are installed.
+    if [ "$install_pi" -eq 0 ] || find_installed_coding_agent pi >/dev/null; then
+        if [ "$install_dsh" -eq 1 ]; then require_dsh_toolchain; fi
+        if [ "$install_cline" -eq 1 ] && ! command -v cline >/dev/null 2>&1; then
+            command -v npm >/dev/null 2>&1 || fail "Cline installation requires npm. Install Node.js from https://nodejs.org/en/download, then rerun the installer."
+        fi
+    fi
+    if [ "$install_hermes" -eq 1 ] && ! command -v hermes >/dev/null 2>&1; then confirm_hermes_platform; fi
+    if [ "$install_opencode" -eq 1 ]; then check_opencode_install; fi
+    if [ "$enable_rtk_headroom" -eq 1 ] && ! command -v rtk >/dev/null 2>&1; then select_rtk_release; fi
+fi
+
+start_install_step uv "Ensuring uv $MIN_UV_VERSION or newer is installed"
 ensure_uv
 
 ensure_selected_coding_agents
-configure_rtk_for_selected_agents
 
-step "Installing or updating Free Claude Code"
+start_install_step "FCC package" "Installing or updating Free Claude Code"
 install_free_claude_code
 
-step "Configuring PATH and verifying Free Claude Code"
 configure_and_verify_free_claude_code
 
 if [ "$(uname -s)" = "Darwin" ]; then
-    step "Installing the Free Claude Code desktop launcher"
+    start_install_step "Desktop integration" "Installing the Free Claude Code desktop launcher"
     install_macos_desktop_app
+    desktop_ready=1
 fi
+if [ "$enable_rtk_headroom" -eq 1 ]; then
+    start_install_step "Headroom verification"
+    ensure_headroom
+    start_install_step "RTK configuration"
+    configure_rtk_for_selected_agents
+    start_install_step "Headroom configuration"
+    configure_headroom_for_selected_agents
+fi
+complete_install_step
 
 if [ "$dry_run" -eq 1 ]; then
     printf '\nDry run complete. No changes were made.\n'
-else
-    if [ "$(uname -s)" = "Darwin" ]; then
-        printf '\nFree Claude Code is installed and verified. Open Free Claude Code from Applications or the desktop to run it in the background.\n'
-        printf 'For terminal use, start the proxy with: fcc-server\n'
-    else
-        printf '\nFree Claude Code is installed and verified. Start the proxy with: fcc-server\n'
-    fi
-    if [ "$install_claude" -eq 1 ]; then
-        printf 'Run Claude Code with: fcc-claude\n'
-    fi
-    if [ "$install_codex" -eq 1 ]; then
-        printf 'Run Codex with: fcc-codex\n'
-    fi
-    if [ "$pi_available" -eq 1 ]; then
-        printf 'Run Pi with: fcc-pi\n'
-    fi
-    if [ "$install_opencode" -eq 1 ]; then
-        printf 'Run OpenCode with: fcc-opencode\n'
-    fi
-    if [ "$install_cline" -eq 1 ]; then
-        printf 'Run Cline with: fcc-cline\n'
-    else
-        printf 'The fcc-cline wrapper is ready after you install Cline CLI.\n'
-    fi
-    if [ "$install_hermes" -eq 1 ]; then
-        printf 'Run Hermes Agent with: fcc-hermes\n'
-    else
-        printf 'The fcc-hermes wrapper is ready after you install Hermes Agent.\n'
-    fi
-    if [ "$install_dsh" -eq 1 ]; then
-        printf 'Run DeepSeek Harness with: fcc-dsh\n'
-    else
-        printf 'The fcc-dsh wrapper is ready after you install DeepSeek Harness %s.\n' "$DSH_VERSION"
-    fi
-    if [ "$install_grok" -eq 1 ]; then
-        printf 'Run Grok Build with: fcc-grok\n'
-    else
-        printf 'The fcc-grok wrapper is ready after you install Grok Build.\n'
-    fi
-    if [ "$install_muse" -eq 1 ]; then
-        printf 'Run Muse Code with: fcc-muse\n'
-    else
-        printf 'The fcc-muse wrapper is ready after you install Muse Code.\n'
-    fi
-    if [ "$install_aider" -eq 1 ]; then
-        printf 'Run Aider with: fcc-aider\n'
-    else
-        printf 'The fcc-aider wrapper is ready after you install Aider.\n'
-    fi
 fi

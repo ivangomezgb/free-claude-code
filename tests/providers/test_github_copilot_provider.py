@@ -35,6 +35,8 @@ from free_claude_code.core.reasoning import (
     ReasoningEffort,
     ReasoningPolicy,
 )
+from free_claude_code.core.stream_output import StreamOutput
+from free_claude_code.core.stream_recovery import ContinuationSeed
 from free_claude_code.providers.anthropic_messages.request_policy import (
     MessagesModelCapabilities,
 )
@@ -54,7 +56,11 @@ from free_claude_code.providers.openai_responses.transport import (
     OpenAIResponsesTransport,
 )
 from tests.providers.copilot_support import FakeRuntime, FakeSession
-from tests.providers.support import immediate_admission, make_provider_config
+from tests.providers.support import (
+    continuation_seed,
+    immediate_admission,
+    make_provider_config,
+)
 from tests.providers.test_anthropic_messages_transport import _events as messages_events
 from tests.providers.test_anthropic_messages_transport import _sse as messages_sse
 from tests.providers.test_openai_responses_transport import (
@@ -69,8 +75,9 @@ from tests.providers.test_openai_responses_transport import (
 @pytest.mark.asyncio
 @pytest.mark.parametrize("egress", list(CopilotEgress))
 @pytest.mark.parametrize("responses", [False, True])
+@pytest.mark.parametrize("seeded", [False, True])
 async def test_conversion_runs_once_under_current_account_lease(
-    tmp_path, egress, responses
+    tmp_path, egress, responses, seeded
 ):
     harness = Harness(tmp_path, egress)
     cls, name = {
@@ -101,8 +108,21 @@ async def test_conversion_runs_once_under_current_account_lease(
 
     try:
         with patch.object(cls, name, autospec=True, side_effect=build) as conversion:
-            assert "ok" in await collect(harness.stream(responses))
+            assert "ok" in await collect(
+                harness.stream(
+                    responses,
+                    continuation=continuation_seed("Prefix text", "Prior reasoning")
+                    if seeded
+                    else None,
+                )
+            )
         assert conversion.call_count == len(harness.seen) == 1
+        if seeded:
+            body = json.loads(harness.seen[0].content)
+            history = body.get("messages", body.get("input"))
+            assert "Prefix text" in str(history[-2])
+            assert "Prior reasoning" in str(history[:-1])
+            assert "Prior reasoning" not in str(history[-1])
         assert harness.provider._active == 0
     finally:
         await harness.close()
@@ -283,14 +303,21 @@ class Harness:
         *,
         reasoning: ReasoningPolicy = DEFAULT_REASONING_POLICY,
         history: bool = False,
-    ) -> AsyncIterator[str]:
+        continuation: ContinuationSeed | None = None,
+    ) -> AsyncIterator[StreamOutput]:
         request = _request(responses, self.runtime.name, history=history)
         if isinstance(request, MessagesRequest):
             return self.provider.stream_messages(
-                request, response_model="public-alias", reasoning=reasoning
+                request,
+                response_model="public-alias",
+                reasoning=reasoning,
+                continuation=continuation,
             )
         return self.provider.stream_responses(
-            request, response_model="public-alias", reasoning=reasoning
+            request,
+            response_model="public-alias",
+            reasoning=reasoning,
+            continuation=continuation,
         )
 
     async def close(self) -> None:
@@ -331,7 +358,7 @@ async def test_classifier_uses_current_lease_controls_and_clears_raw_hints(
     )
     try:
         output = [
-            event
+            frame
             async for event in harness.provider.stream_messages(
                 request,
                 reasoning=ReasoningPolicy.prefer_off(),
@@ -339,6 +366,7 @@ async def test_classifier_uses_current_lease_controls_and_clears_raw_hints(
                     harness.runtime.name, reasoning_capability=ReasoningCapability.NONE
                 ),
             )
+            for frame in event.frames
         ]
         assert text_content(parse_sse_text("".join(output))) == "ok"
         body = json.loads(harness.seen[0].content)
@@ -461,8 +489,8 @@ def _request(
     )
 
 
-async def collect(stream: AsyncIterator[str]) -> str:
-    return "".join([event async for event in stream])
+async def collect(stream: AsyncIterator[StreamOutput]) -> str:
+    return "".join([frame async for event in stream for frame in event.frames])
 
 
 @pytest.mark.asyncio
@@ -654,7 +682,7 @@ async def test_native_reasoning_carrier_replays_only_to_messages_egress(
             await collect(harness.provider.stream_responses(request))
             body = json.loads(harness.seen[0].content)
             wire = json.dumps(body)
-            assert "[Earlier reasoning]" in wire
+            assert "[Earlier reasoning]" not in wire
             assert "private reasoning" in wire
             assert "exact-signature" not in wire
             assert carrier not in wire

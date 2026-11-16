@@ -25,7 +25,7 @@ from free_claude_code.runtime.codex_app_server import (
     CodexAppServer,
     CodexHarnessFactory,
 )
-from tests.code_sessions_support import FakeHarness
+from tests.code_sessions_support import FakeHarness, close_code_database
 
 
 @dataclass
@@ -77,7 +77,7 @@ def factory_runtime():
             "open_router/selected", supports_thinking=False, context_window_tokens=32000
         ),
     )
-    runtime.wait_for_catalog.return_value = ModelCatalogSnapshot(
+    runtime.wait_for_model_catalog.return_value = ModelCatalogSnapshot(
         runtime.current_settings(), runtime.cached_prefixed_model_infos()
     )
     runtime.acquire.side_effect = AssertionError("Setup must not acquire a provider")
@@ -113,6 +113,7 @@ async def test_factory_open_preserves_setup_and_catalog_until_process_exit(
             "base_url": "http://127.0.0.1:8182/v1",
             "auth": {"command": "fcc-codex", "args": ["--print-proxy-auth-token"]},
             "wire_api": "responses",
+            "stream_idle_timeout_ms": 2147483647,
         }
         assert factory_peer.command[-5:] == (
             "-c",
@@ -200,7 +201,7 @@ async def test_history_open_needs_no_fcc_setup_or_inventory(tmp_path, factory_pe
 
 @pytest.mark.asyncio
 async def test_child_warning_during_shutdown_allows_connection_replacement(
-    tmp_path, monkeypatch
+    database_factory, tmp_path, monkeypatch
 ):
     harness = FakeHarness()
     prepare = harness.prepare
@@ -242,7 +243,8 @@ async def test_child_warning_during_shutdown_allows_connection_replacement(
 
     monkeypatch.setattr(harness, "prepare", selection_for)
     service = CodeService(
-        SQLiteCodeStore(tmp_path / "code.db", tmp_path / "code.lock"), harness
+        SQLiteCodeStore(database_factory(tmp_path / "code.db", tmp_path / "code.lock")),
+        harness,
     )
     await service.start()
     observing = asyncio.create_task(warning.wait())
@@ -286,6 +288,7 @@ async def test_child_warning_during_shutdown_allows_connection_replacement(
         observing.cancel()
         await asyncio.gather(observing, return_exceptions=True)
         await service.close()
+        await close_code_database(service)
 
 
 @pytest.mark.asyncio
@@ -468,7 +471,7 @@ async def test_jsonl_large_unicode_events_can_precede_rpc_ack(tmp_path):
 
 @pytest.mark.asyncio
 async def test_terminal_storage_failure_drains_the_native_dispatcher(
-    tmp_path, monkeypatch
+    database_factory, tmp_path, monkeypatch
 ):
     harness = FakeHarness()
     prepare = harness.prepare
@@ -498,7 +501,9 @@ async def test_terminal_storage_failure_drains_the_native_dispatcher(
         return selection
 
     monkeypatch.setattr(harness, "prepare", select)
-    store = SQLiteCodeStore(tmp_path / "code.db", tmp_path / "code.lock")
+    store = SQLiteCodeStore(
+        database_factory(tmp_path / "code.db", tmp_path / "code.lock")
+    )
     save = store.save_progress
     rejected = []
 
@@ -532,6 +537,7 @@ async def test_terminal_storage_failure_drains_the_native_dispatcher(
             await service.get_detail(session.id)
     finally:
         await asyncio.wait_for(service.close(), 5)
+        await close_code_database(service)
 
 
 @pytest.mark.asyncio

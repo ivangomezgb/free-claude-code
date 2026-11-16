@@ -9,18 +9,25 @@ from typing import Any
 
 import httpx2
 from openai import AsyncOpenAI
+from packaging.version import Version
 
 from free_claude_code.application.model_metadata import ProviderModelInfo
 from free_claude_code.core.anthropic.models import MessagesRequest
+from free_claude_code.core.chat_completions.request import ChatRequest
+from free_claude_code.core.gemini import GeminiRequest
 from free_claude_code.core.openai_responses import OpenAIResponsesRequest
 from free_claude_code.core.reasoning import DEFAULT_REASONING_POLICY, ReasoningPolicy
+from free_claude_code.core.stream_output import StreamOutput
+from free_claude_code.core.stream_recovery import ContinuationSeed
 from free_claude_code.providers.admission import (
     ProviderAdmissionController,
+    ProviderCorrectionAction,
     ProviderOperationKind,
 )
 from free_claude_code.providers.base import BaseProvider, ProviderConfig
 from free_claude_code.providers.endpoint import RequestEndpoint
-from free_claude_code.providers.failure_policy import provider_authentication_status
+from free_claude_code.providers.failure_classification import classify
+from free_claude_code.providers.history_negotiation import HistoryModeCache
 from free_claude_code.providers.http import ProviderAttemptScope
 from free_claude_code.providers.model_listing import (
     optional_input_modalities,
@@ -29,7 +36,11 @@ from free_claude_code.providers.model_listing import (
 )
 from free_claude_code.providers.openai_client import OpenAIRequestClient
 from free_claude_code.providers.openai_responses import OpenAIResponsesTransport
-from free_claude_code.providers.request_recovery import RequestRecovery
+from free_claude_code.providers.stream_failure_resolution import (
+    Repair,
+    Stage,
+    repairs,
+)
 
 from .auth import OpenAIAuthManager
 from .endpoint import CodexEndpointContext
@@ -50,9 +61,10 @@ class OpenAICodexProvider(BaseProvider):
         *,
         auth: OpenAIAuthManager,
         admission: ProviderAdmissionController,
+        history_cache: HistoryModeCache | None = None,
         transport: httpx2.AsyncBaseTransport | None = None,
     ) -> None:
-        super().__init__(config)
+        super().__init__(config, history_cache=history_cache)
         self._auth = auth
         self._admission = admission
         self._client_headers = {
@@ -80,6 +92,7 @@ class OpenAICodexProvider(BaseProvider):
         self._responses = OpenAIResponsesTransport(
             client=self._client,
             admission=admission,
+            history_cache=self._history_cache,
             provider_name="OpenAI",
             read_timeout_s=config.http_read_timeout,
             log_raw_sse_events=config.log_raw_sse_events,
@@ -104,10 +117,10 @@ class OpenAICodexProvider(BaseProvider):
 
     async def _list_models_payload(self) -> Any:
         """Admit each catalog GET while borrowing request-scoped SDK credentials."""
-        execution = self._admission.start_execution()
+        execution = self._admission.start_execution(model=None)
         endpoint = RequestEndpoint(self._endpoint())
         request_client = OpenAIRequestClient(self._pool)
-        recovery = RequestRecovery(execution, endpoint=endpoint)
+        refreshed = False
         try:
             while execution.can_attempt:
                 scope: ProviderAttemptScope | None = None
@@ -126,7 +139,9 @@ class OpenAICodexProvider(BaseProvider):
                     payload = await client.get(
                         "models",
                         cast_to=object,
-                        options={"params": {"client_version": FCC_VERSION}},
+                        options={
+                            "params": {"client_version": _model_list_client_version()}
+                        },
                     )
                     await attempt.accept()
                     execution.succeed()
@@ -135,14 +150,30 @@ class OpenAICodexProvider(BaseProvider):
                     raise
                 except Exception as error:
                     if scope is not None:
-                        if await recovery.retry_authentication(
-                            error, provider_authentication_status(error), scope.attempt
+                        found = repairs(
+                            stage=Stage.OPEN,
+                            auth_status=classify(error).auth_status,
+                            can_refresh=endpoint.can_refresh,
+                            refreshed=refreshed,
+                            content_released=None,
+                            attempt_content_released=False,
+                            normal_stop_seen=False,
+                            continuing=False,
+                        )
+                        if (
+                            Repair.REFRESH in found
+                            and await scope.attempt.correct(error)
+                            is ProviderCorrectionAction.RETRY
                         ):
+                            refreshed = True
+                            endpoint.request_refresh()
                             continue
                         if not scope.attempt.accepted:
                             decision = await scope.attempt.fail(error)
                             if decision.retry_allowed:
                                 continue
+                            if decision.error is not error:
+                                raise decision.error from error
                     execution.fail(error)
                     raise
                 finally:
@@ -167,7 +198,8 @@ class OpenAICodexProvider(BaseProvider):
         reasoning: ReasoningPolicy = DEFAULT_REASONING_POLICY,
         request_headers: Mapping[str, str] | None = None,
         model_info: ProviderModelInfo | None = None,
-    ) -> AsyncIterator[str]:
+        continuation: ContinuationSeed | None = None,
+    ) -> AsyncIterator[StreamOutput]:
         return self._responses.stream_messages(
             request,
             input_tokens=input_tokens,
@@ -176,6 +208,51 @@ class OpenAICodexProvider(BaseProvider):
             reasoning=reasoning,
             endpoint_context=self._endpoint(session_id=str(uuid.uuid4())),
             model_info=model_info,
+            continuation=continuation,
+        )
+
+    def stream_chat(
+        self,
+        request: ChatRequest,
+        input_tokens: int = 0,
+        *,
+        request_id: str | None = None,
+        response_model: str | None = None,
+        reasoning: ReasoningPolicy = DEFAULT_REASONING_POLICY,
+        request_headers: Mapping[str, str] | None = None,
+        model_info: ProviderModelInfo | None = None,
+        continuation: ContinuationSeed | None = None,
+    ) -> AsyncIterator[StreamOutput]:
+        return self._responses.stream_chat(
+            request,
+            input_tokens=input_tokens,
+            request_id=request_id,
+            response_model=response_model or request.model,
+            reasoning=reasoning,
+            endpoint_context=self._endpoint(session_id=str(uuid.uuid4())),
+            continuation=continuation,
+        )
+
+    def stream_gemini(
+        self,
+        request: GeminiRequest,
+        input_tokens: int = 0,
+        *,
+        request_id: str | None = None,
+        response_model: str | None = None,
+        reasoning: ReasoningPolicy = DEFAULT_REASONING_POLICY,
+        request_headers: Mapping[str, str] | None = None,
+        model_info: ProviderModelInfo | None = None,
+        continuation: ContinuationSeed | None = None,
+    ) -> AsyncIterator[StreamOutput]:
+        return self._responses.stream_gemini(
+            request,
+            input_tokens=input_tokens,
+            request_id=request_id,
+            response_model=response_model or request.model,
+            reasoning=reasoning,
+            endpoint_context=self._endpoint(session_id=str(uuid.uuid4())),
+            continuation=continuation,
         )
 
     def stream_responses(
@@ -187,7 +264,9 @@ class OpenAICodexProvider(BaseProvider):
         response_model: str | None = None,
         reasoning: ReasoningPolicy = DEFAULT_REASONING_POLICY,
         request_headers: Mapping[str, str] | None = None,
-    ) -> AsyncIterator[str]:
+        model_info: ProviderModelInfo | None = None,
+        continuation: ContinuationSeed | None = None,
+    ) -> AsyncIterator[StreamOutput]:
         return self._responses.stream_responses(
             request,
             input_tokens=input_tokens,
@@ -195,7 +274,21 @@ class OpenAICodexProvider(BaseProvider):
             response_model=response_model or request.model,
             reasoning=reasoning,
             endpoint_context=self._endpoint(session_id=str(uuid.uuid4())),
+            continuation=continuation,
         )
+
+
+def _model_list_client_version() -> str:
+    """Format FCC's release and VCS development versions for the catalog API."""
+    if FCC_VERSION == "dev":
+        return "0.0.0-dev"
+    parsed = Version(FCC_VERSION)
+    formatted = f"{parsed.major}.{parsed.minor}.{parsed.micro}"
+    if parsed.dev is not None:
+        formatted += f"-dev.{parsed.dev}"
+    if parsed.local is not None:
+        formatted += f"+{parsed.local}"
+    return formatted
 
 
 async def _endpoint_required() -> str:

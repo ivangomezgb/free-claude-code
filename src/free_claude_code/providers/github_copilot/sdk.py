@@ -1,4 +1,4 @@
-"""Pinned official Copilot SDK boundary; never run SDK agent turns."""
+"""Official Copilot SDK boundary; never run SDK agent turns."""
 
 import asyncio
 import re
@@ -103,7 +103,7 @@ class SdkRuntime:
             try:
                 client = CopilotClient(
                     connection=RuntimeConnection.for_stdio(
-                        path=path, args=("--disable-builtin-mcps",)
+                        path=path, args=("--no-auto-update", "--disable-builtin-mcps")
                     ),
                     env=env,
                     working_directory=directory.name,

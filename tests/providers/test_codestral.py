@@ -13,6 +13,7 @@ from tests.providers.support import (
     immediate_admission,
     make_provider_config,
     profiled_provider,
+    sdk_chat_chunk,
 )
 
 
@@ -25,8 +26,6 @@ def codestral_config():
     return make_provider_config(
         api_key="test_codestral_key",
         base_url=CODESTRAL_DEFAULT_BASE,
-        rate_limit=10,
-        rate_window=60,
     )
 
 
@@ -72,8 +71,6 @@ def test_build_request_body_global_disable_blocks_reasoning_mapping():
         make_provider_config(
             api_key="test_codestral_key",
             base_url=CODESTRAL_DEFAULT_BASE,
-            rate_limit=10,
-            rate_window=60,
         ),
         admission=immediate_admission(),
     )
@@ -166,14 +163,18 @@ async def test_stream_messages_text(codestral_provider):
     mock_chunk.usage = MagicMock(completion_tokens=5, prompt_tokens=10)
 
     async def mock_stream():
-        yield mock_chunk
+        yield sdk_chat_chunk(mock_chunk)
 
     with patch.object(
         codestral_provider._client.chat.completions, "create", new_callable=AsyncMock
     ) as mock_create:
         mock_create.return_value = SDKStreamDouble(mock_stream())
 
-        events = [event async for event in codestral_provider.stream_messages(req)]
+        events = [
+            frame
+            async for event in codestral_provider.stream_messages(req)
+            for frame in event.frames
+        ]
 
         assert any(
             '"text_delta"' in event and "Hello back!" in event for event in events
@@ -199,14 +200,18 @@ async def test_stream_messages_reasoning_content(codestral_provider):
     mock_chunk.usage = MagicMock(completion_tokens=2, prompt_tokens=10)
 
     async def mock_stream():
-        yield mock_chunk
+        yield sdk_chat_chunk(mock_chunk)
 
     with patch.object(
         codestral_provider._client.chat.completions, "create", new_callable=AsyncMock
     ) as mock_create:
         mock_create.return_value = SDKStreamDouble(mock_stream())
 
-        events = [event async for event in codestral_provider.stream_messages(req)]
+        events = [
+            frame
+            async for event in codestral_provider.stream_messages(req)
+            for frame in event.frames
+        ]
 
         assert any(
             '"thinking_delta"' in event and "Thinking..." in event for event in events

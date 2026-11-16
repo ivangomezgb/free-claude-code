@@ -14,6 +14,7 @@ from tests.providers.support import (
     make_provider_config,
     profiled_provider,
     reasoning_for,
+    sdk_chat_chunk,
 )
 
 
@@ -26,8 +27,6 @@ def cohere_config():
     return make_provider_config(
         api_key="test_cohere_key",
         base_url=COHERE_DEFAULT_BASE,
-        rate_limit=10,
-        rate_window=60,
     )
 
 
@@ -147,8 +146,6 @@ def test_build_request_body_maps_reasoning_off_to_none():
         make_provider_config(
             api_key="test_cohere_key",
             base_url=COHERE_DEFAULT_BASE,
-            rate_limit=10,
-            rate_window=60,
         ),
         admission=immediate_admission(),
     )
@@ -201,7 +198,7 @@ async def test_stream_messages_text(cohere_provider):
     mock_chunk.usage = MagicMock(completion_tokens=5, prompt_tokens=10)
 
     async def mock_stream():
-        yield mock_chunk
+        yield sdk_chat_chunk(mock_chunk)
 
     with patch.object(
         cohere_provider._client.chat.completions, "create", new_callable=AsyncMock
@@ -209,7 +206,9 @@ async def test_stream_messages_text(cohere_provider):
         mock_create.return_value = SDKStreamDouble(mock_stream())
 
         events = [
-            event async for event in cohere_provider.stream_messages(make_request())
+            frame
+            async for event in cohere_provider.stream_messages(make_request())
+            for frame in event.frames
         ]
 
     assert any(
@@ -236,7 +235,7 @@ async def test_stream_messages_tool_call(cohere_provider):
     mock_chunk.usage = MagicMock(completion_tokens=5, prompt_tokens=10)
 
     async def mock_stream():
-        yield mock_chunk
+        yield sdk_chat_chunk(mock_chunk)
 
     with patch.object(
         cohere_provider._client.chat.completions, "create", new_callable=AsyncMock
@@ -244,7 +243,9 @@ async def test_stream_messages_tool_call(cohere_provider):
         mock_create.return_value = SDKStreamDouble(mock_stream())
 
         events = [
-            event async for event in cohere_provider.stream_messages(make_request())
+            frame
+            async for event in cohere_provider.stream_messages(make_request())
+            for frame in event.frames
         ]
 
     assert any(
@@ -271,7 +272,7 @@ async def test_stream_messages_reasoning_content(cohere_provider):
     mock_chunk.usage = MagicMock(completion_tokens=2, prompt_tokens=10)
 
     async def mock_stream():
-        yield mock_chunk
+        yield sdk_chat_chunk(mock_chunk)
 
     with patch.object(
         cohere_provider._client.chat.completions, "create", new_callable=AsyncMock
@@ -279,7 +280,9 @@ async def test_stream_messages_reasoning_content(cohere_provider):
         mock_create.return_value = SDKStreamDouble(mock_stream())
 
         events = [
-            event async for event in cohere_provider.stream_messages(make_request())
+            frame
+            async for event in cohere_provider.stream_messages(make_request())
+            for frame in event.frames
         ]
 
     assert any(

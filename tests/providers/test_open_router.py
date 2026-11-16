@@ -18,9 +18,8 @@ from free_claude_code.core.anthropic.stream_contracts import (
     thinking_content,
 )
 from free_claude_code.core.failures import FailureKind
-from free_claude_code.core.history_replay import decode_replay
 from free_claude_code.core.model_capabilities import ModelInputModality
-from free_claude_code.providers.failure_policy import classify_provider_failure
+from free_claude_code.providers.failure_reporting import finalize_provider_failure
 from free_claude_code.providers.open_router import OpenRouterProvider
 from free_claude_code.providers.openai_chat import OpenAIChatProvider
 from tests.providers.request_factory import make_messages_request
@@ -30,6 +29,7 @@ from tests.providers.support import (
     immediate_admission,
     make_provider_config,
     reasoning_for,
+    sdk_chat_chunk,
 )
 
 
@@ -63,7 +63,8 @@ def test_image_routing_failure_explains_unsupported_input(
 ):
     body = {**image_routing_error_body(), "message": message}
     error = routing_error({"error": body} if wrapped else body)
-    failure = classify_provider_failure(
+    assert open_router_provider._chat._behavior.media_rejected(error)
+    failure = finalize_provider_failure(
         error,
         provider_name="OPENROUTER",
         read_timeout_s=30,
@@ -79,7 +80,7 @@ def test_image_routing_failure_explains_unsupported_input(
     assert "HTTP 404" in failure.message
     assert "req_image" in failure.message
     assert (
-        classify_provider_failure(
+        finalize_provider_failure(
             error, provider_name="OTHER", read_timeout_s=30, request_id=None
         ).status_code
         == 404
@@ -108,14 +109,15 @@ def test_image_routing_failure_explains_unsupported_input(
 )
 def test_unrelated_routing_errors_keep_shared_policy(open_router_provider, body):
     error = routing_error(body)
-    override = open_router_provider._chat._behavior.failure_override
-    assert override(error) is None
-    failure = classify_provider_failure(
+    behavior = open_router_provider._chat._behavior
+    assert behavior.failure_override(error) is None
+    assert not behavior.media_rejected(error)
+    failure = finalize_provider_failure(
         error,
         provider_name="OPENROUTER",
         read_timeout_s=30,
         request_id=None,
-        provider_failure_override=override,
+        provider_failure_override=behavior.failure_override,
     )
     assert failure.status_code == 404
 
@@ -156,8 +158,6 @@ def open_router_provider():
         make_provider_config(
             api_key="test_openrouter_key",
             base_url="https://openrouter.ai/api/v1",
-            rate_limit=10,
-            rate_window=60,
         ),
         admission=immediate_admission(),
     )
@@ -178,7 +178,7 @@ def _chunk(
     if reasoning_details is not None:
         delta.reasoning_details = reasoning_details
     choice = SimpleNamespace(delta=delta, finish_reason=finish_reason)
-    return SimpleNamespace(choices=[choice], usage=None)
+    return sdk_chat_chunk(SimpleNamespace(choices=[choice], usage=None))
 
 
 def test_init_uses_openai_chat_provider(open_router_provider):
@@ -423,23 +423,21 @@ async def test_stream_maps_reasoning_content_and_details(open_router_provider):
         return_value=stream,
     ):
         events = [
-            event
+            frame
             async for event in open_router_provider.stream_messages(make_request())
+            for frame in event.frames
         ]
 
     event_text = "".join(events)
     parsed = parse_sse_text(event_text)
     assert thinking_content(parsed) == "plan "
     carriers = [
-        event.data["delta"]["signature"]
+        event.data["content_block"]["data"]
         for event in parsed
-        if event.data.get("delta", {}).get("type") == "signature_delta"
+        if event.event == "content_block_start"
+        and event.data["content_block"]["type"] == "redacted_thinking"
     ]
-    assert len(carriers) == 1
-    assert decode_replay(carriers[0]).native["reasoning_details"] == [
-        {"type": "reasoning.text", "text": "plan "},
-        redacted,
-    ]
+    assert carriers == [redacted["data"]]
     assert text_content(parsed) == "done"
     assert stream.closed
 

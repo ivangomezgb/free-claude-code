@@ -17,12 +17,17 @@ from free_claude_code.core.diagnostics import (
     redacted_exception_traceback,
     safe_exception_message,
 )
+from free_claude_code.core.gemini import gemini_error_payload
 from free_claude_code.core.openai_responses import (
     openai_error_payload,
     openai_error_type_for_failure,
 )
+from free_claude_code.core.request_outcomes import (
+    record_request_exception,
+    record_request_failure,
+)
 
-WireApi = Literal["messages", "responses"]
+WireApi = Literal["messages", "responses", "gemini", "chat"]
 
 
 def require_non_empty_messages(messages: Sequence[object]) -> None:
@@ -37,7 +42,13 @@ def ordinary_application_error_response(
     request_id: str,
 ) -> JSONResponse:
     """Serialize a deterministic application error without terminal headers."""
-    if wire_api == "responses":
+    record_request_failure(error.kind.value)
+    if wire_api == "gemini":
+        return JSONResponse(
+            status_code=error.status_code,
+            content=gemini_error_payload(error.status_code, error.message),
+        )
+    if wire_api in {"responses", "chat"}:
         return JSONResponse(
             status_code=error.status_code,
             content=openai_error_payload(
@@ -51,6 +62,7 @@ def ordinary_application_error_response(
             error_type=anthropic_error_type_for_failure(error.kind),
             message=error.message,
             request_id=request_id,
+            error_code=error.error_code,
         ),
     )
 
@@ -67,6 +79,7 @@ def log_unexpected_api_exception(
     request_id: str | None = None,
 ) -> None:
     """Log API failures without echoing exception text unless opted in."""
+    record_request_exception(exc)
     if settings.log_api_error_tracebacks:
         if request_id is not None:
             logger.error(

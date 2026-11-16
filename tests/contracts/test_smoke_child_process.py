@@ -1,7 +1,15 @@
+import json
 import subprocess
+from contextlib import nullcontext
 from pathlib import Path
 from unittest.mock import MagicMock
 
+import httpx
+import pytest
+
+from free_claude_code.config import env_migrations, paths
+from free_claude_code.config.env_migrations import atomic_write_managed_config
+from free_claude_code.config.loader import ManagedConfigStore
 from free_claude_code.config.settings import Settings
 from smoke.lib import child_process
 from smoke.lib import e2e as smoke_e2e
@@ -12,21 +20,92 @@ from smoke.lib.child_process import (
     cmd_python_c,
     run_captured_text,
 )
-from smoke.lib.config import SmokeConfig
+from smoke.lib.config import ProviderModel, SmokeConfig
 from smoke.lib.e2e import ConversationDriver
 from smoke.lib.http import collect_message_stream
 from smoke.lib.server import RunningServer
+from smoke.product import test_client_product_live as client_smoke
+from smoke.product import test_provider_product_live as provider_smoke
+
+
+def test_isolated_smoke_client_uses_server_token_without_importing_legacy_config(
+    monkeypatch, tmp_path: Path
+):
+    original = paths.managed_env_path()
+    atomic_write_managed_config({"ANTHROPIC_AUTH_TOKEN": "server-token"}, path=original)
+    original_bytes = original.read_bytes()
+    server_settings = ManagedConfigStore().read({}).settings
+    legacy = tmp_path / "legacy.env"
+    legacy.write_text(
+        "ANTHROPIC_AUTH_TOKEN=legacy-token\nGROQ_API_KEY=legacy-provider-secret\n"
+    )
+    legacy_bytes = legacy.read_bytes()
+    monkeypatch.setattr(env_migrations, "verified_checkout_env_path", lambda: legacy)
+    monkeypatch.delenv("FCC_ENV_FILE", raising=False)
+
+    env = client_smoke._isolated_dsh_env(
+        tmp_path=tmp_path,
+        server_port=4567,
+        auth_token=server_settings.proxy_auth_token,
+        credential_env_keys=client_smoke._provider_credential_env_keys(),
+    )
+    monkeypatch.setattr(paths, "config_dir_path", lambda: Path(env["HOME"]) / ".fcc")
+    process = {"ANTHROPIC_AUTH_TOKEN": "conflicting-process-token"}
+    store = ManagedConfigStore()
+    store.initialize(process)
+    snapshot = store.read(process)
+
+    assert snapshot.settings.proxy_auth_token == server_settings.proxy_auth_token
+    assert "GROQ_API_KEY" not in snapshot.managed
+    assert original.read_bytes() == original_bytes
+    assert legacy.read_bytes() == legacy_bytes
+
+
+def test_smoke_counts_access_records_once_in_mixed_logs():
+    access = '127.0.0.1:1234 - "POST /v1/responses HTTP/1.1" 200'
+    record = json.dumps({"text": access + "\n", "record": {"message": access}})
+    other_messages = (
+        '127.0.0.1:1234 - "GET /v1/responses HTTP/1.1" 200',
+        '127.0.0.1:1234 - "POST /v1/responses/extra HTTP/1.1" 200',
+        '127.0.0.1:1234 - "POST /v1/chat/completions HTTP/1.1" 200',
+    )
+    output = "\n".join(
+        [access, record, access, record, "{malformed", "[]", "null", '{"record":null}']
+        + [json.dumps({"record": {"message": message}}) for message in other_messages]
+        + [json.dumps({"text": access, "record": {"message": "unrelated"}})]
+    )
+
+    assert client_smoke._access_request_count(output, "POST", "/v1/responses") == 2
+
+
+def test_smoke_reads_native_trace_events_from_mixed_subprocess_output():
+    output = (
+        'INFO: server started\n{"type":"result"}\n'
+        '{"text":"ordinary log record\\n","record":{"extra":{}}}\n'
+        '{"text":"trace event\\n","record":{"extra":{"trace_payload":'
+        '{"stage":"execution","event":"test.completed","source":"test","status":200}}}}\n'
+    )
+    assert client_smoke._trace_log_events(output) == [
+        {
+            "stage": "execution",
+            "event": "test.completed",
+            "source": "test",
+            "status": 200,
+        }
+    ]
+    assert {"type": "result"} in client_smoke._json_object_lines(output)
 
 
 def test_fcc_server_command_uses_cli_entrypoint() -> None:
     assert cmd_fcc_server() == [
         child_process.python_exe(),
         "-c",
-        "from free_claude_code.cli.entrypoints import serve; serve()",
+        "from smoke.lib.server_runtime import serve; serve()",
     ]
 
 
 def test_start_server_disables_cli_admin_browser(monkeypatch, tmp_path: Path) -> None:
+    ManagedConfigStore().initialize({})
     captured: dict[str, object] = {}
 
     class FakeProcess:
@@ -114,6 +193,141 @@ def test_conversation_driver_explicitly_requests_sse(
     assert payload["stream"] is False
     assert turn.request["stream"] is True
     assert turn.events[-1].event == "message_stop"
+
+
+def test_smoke_conversation_identity_survives_turns_and_tool_results(
+    monkeypatch, tmp_path: Path
+) -> None:
+    captured = []
+
+    def fake_stream(_method, _url, **kwargs):
+        captured.append(httpx.Headers(kwargs["headers"]))
+        return _FakeStreamResponse()
+
+    monkeypatch.setattr(smoke_e2e.httpx, "stream", fake_stream)
+    server, config = _running_server(tmp_path), _smoke_config(tmp_path)
+    conversation = ConversationDriver(server, config)
+    conversation.ask("First turn")
+    conversation.ask("Second turn")
+    conversation.stream(
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "tool-1",
+                            "content": "done",
+                        }
+                    ],
+                }
+            ]
+        }
+    )
+    ConversationDriver(server, config).ask("Different conversation")
+
+    assert captured[0]["x-opencode-session"]
+    assert len({h["x-opencode-session"] for h in captured[:3]}) == 1
+    assert captured[3]["x-opencode-session"] != captured[0]["x-opencode-session"]
+    assert all(h["user-agent"].startswith("fcc-smoke/") for h in captured)
+
+
+@pytest.mark.parametrize(
+    "helper", [smoke_http.collect_message_stream, smoke_http.post_json]
+)
+def test_standalone_smoke_requests_identify_themselves_without_changing_auth(
+    monkeypatch, tmp_path: Path, helper
+) -> None:
+    captured = []
+
+    def capture(*args, **kwargs):
+        captured.append(httpx.Headers(kwargs["headers"]))
+        return _FakeStreamResponse()
+
+    monkeypatch.setattr(smoke_http.httpx, "stream", capture)
+    monkeypatch.setattr(smoke_http.httpx, "post", capture)
+    args: list[object] = [_running_server(tmp_path)]
+    if helper is smoke_http.post_json:
+        args.append("/v1/messages")
+    args += [{"messages": []}, _smoke_config(tmp_path)]
+    explicit = {
+        "Authorization": "Bearer explicit",
+        "X-OpenCode-Session": "caller",
+        "User-Agent": "caller/1.0",
+    }
+    helper(*args)
+    helper(*args)
+    helper(*args, headers=explicit)
+    helper(*args, headers={})
+
+    assert captured[0]["x-opencode-session"] != captured[1]["x-opencode-session"]
+    assert captured[0]["user-agent"].startswith("fcc-smoke/")
+    assert captured[2] == httpx.Headers(explicit)
+    assert "authorization" not in captured[3]
+    assert explicit["X-OpenCode-Session"] == "caller"
+
+
+def test_provider_responses_smoke_sends_conversation_identity(monkeypatch, tmp_path):
+    captured = []
+
+    class ResponsesStream(_FakeStreamResponse):
+        def iter_lines(self):
+            return iter(
+                (
+                    "event: response.created",
+                    "data: {}",
+                    "",
+                    "event: response.output_text.delta",
+                    'data: {"delta":"ok"}',
+                    "",
+                    "event: response.completed",
+                    "data: {}",
+                    "",
+                )
+            )
+
+    def capture(*args, **kwargs):
+        captured.append(httpx.Headers(kwargs["headers"]))
+        return ResponsesStream()
+
+    monkeypatch.setattr(
+        provider_smoke,
+        "_server_for_provider",
+        lambda *args: nullcontext(_running_server(tmp_path)),
+    )
+    monkeypatch.setattr(provider_smoke.httpx, "stream", capture)
+    model = ProviderModel("opencode_go", "opencode_go/minimax-m2.7", "test")
+    for _ in range(2):
+        provider_smoke.test_provider_codex_responses_text_e2e(
+            _smoke_config(tmp_path), model
+        )
+    assert captured[0]["x-opencode-session"] != captured[1]["x-opencode-session"]
+    assert all(h["user-agent"].startswith("fcc-smoke/") for h in captured)
+
+
+def test_disconnect_smoke_reuses_identity_for_followup(monkeypatch, tmp_path):
+    captured = []
+
+    def capture(*args, **kwargs):
+        captured.append(httpx.Headers(kwargs["headers"]))
+        return _FakeStreamResponse()
+
+    monkeypatch.setattr(
+        provider_smoke,
+        "_server_for_provider",
+        lambda *args: nullcontext(_running_server(tmp_path)),
+    )
+    monkeypatch.setattr(provider_smoke.httpx, "stream", capture)
+    monkeypatch.setattr(
+        provider_smoke.httpx, "get", lambda *args, **kwargs: httpx.Response(200)
+    )
+    model = ProviderModel("opencode_go", "opencode_go/minimax-m2.7", "test")
+    provider_smoke._scenario_disconnect(_smoke_config(tmp_path), model)
+
+    assert len(captured) == 2
+    assert captured[0]["x-opencode-session"] == captured[1]["x-opencode-session"]
+    assert all(h["user-agent"].startswith("fcc-smoke/") for h in captured)
 
 
 def test_run_captured_text_uses_utf8_replacement(monkeypatch, tmp_path: Path) -> None:

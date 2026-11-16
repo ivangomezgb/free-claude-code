@@ -7,10 +7,13 @@ from free_claude_code.application.errors import (
     ApplicationUnavailableError,
     UnknownProviderError,
 )
+from free_claude_code.config.custom_providers import CustomProviderDefinition
 from free_claude_code.config.provider_catalog import PROVIDER_CATALOG
 from free_claude_code.config.settings import Settings
 from free_claude_code.providers.admission import ProviderAdmissionController
+from free_claude_code.providers.admission_registry import ProviderAdmissionRegistry
 from free_claude_code.providers.base import BaseProvider, ProviderConfig
+from free_claude_code.providers.history_negotiation import HistoryModeCache
 from free_claude_code.providers.openai_chat import (
     OPENAI_CHAT_PROFILES,
     create_openai_chat_provider,
@@ -19,8 +22,28 @@ from free_claude_code.providers.openai_chat import (
 from .config import build_provider_config
 
 ProviderFactory = Callable[
-    [ProviderConfig, Settings, ProviderAdmissionController], BaseProvider
+    [ProviderConfig, Settings, ProviderAdmissionController, HistoryModeCache | None],
+    BaseProvider,
 ]
+
+
+def _load_anthropic() -> ProviderFactory:
+    from free_claude_code.providers.anthropic import AnthropicProvider
+
+    def construct(
+        config: ProviderConfig,
+        settings: Settings,
+        admission: ProviderAdmissionController,
+        history_cache: HistoryModeCache | None = None,
+    ) -> BaseProvider:
+        return AnthropicProvider(
+            config,
+            workspace_id=settings.anthropic_workspace_id,
+            admission=admission,
+            history_cache=history_cache,
+        )
+
+    return construct
 
 
 def _load_nvidia_nim() -> ProviderFactory:
@@ -30,11 +53,12 @@ def _load_nvidia_nim() -> ProviderFactory:
         config: ProviderConfig,
         settings: Settings,
         admission: ProviderAdmissionController,
+        history_cache: HistoryModeCache | None = None,
     ) -> BaseProvider:
         return NvidiaNimProvider(
             config,
-            nim_settings=settings.nim,
             admission=admission,
+            history_cache=history_cache,
         )
 
     return construct
@@ -47,8 +71,27 @@ def _load_open_router() -> ProviderFactory:
         config: ProviderConfig,
         settings: Settings,
         admission: ProviderAdmissionController,
+        history_cache: HistoryModeCache | None = None,
     ) -> BaseProvider:
-        return OpenRouterProvider(config, admission=admission)
+        return OpenRouterProvider(
+            config, admission=admission, history_cache=history_cache
+        )
+
+    return construct
+
+
+def _load_openai_api() -> ProviderFactory:
+    from free_claude_code.providers.openai_api import OpenAIAPIProvider
+
+    def construct(
+        config: ProviderConfig,
+        settings: Settings,
+        admission: ProviderAdmissionController,
+        history_cache: HistoryModeCache | None = None,
+    ) -> BaseProvider:
+        return OpenAIAPIProvider(
+            config, admission=admission, history_cache=history_cache
+        )
 
     return construct
 
@@ -60,8 +103,9 @@ def _load_mistral() -> ProviderFactory:
         config: ProviderConfig,
         settings: Settings,
         admission: ProviderAdmissionController,
+        history_cache: HistoryModeCache | None = None,
     ) -> BaseProvider:
-        return MistralProvider(config, admission=admission)
+        return MistralProvider(config, admission=admission, history_cache=history_cache)
 
     return construct
 
@@ -73,8 +117,9 @@ def _load_kilo() -> ProviderFactory:
         config: ProviderConfig,
         settings: Settings,
         admission: ProviderAdmissionController,
+        history_cache: HistoryModeCache | None = None,
     ) -> BaseProvider:
-        return KiloProvider(config, admission=admission)
+        return KiloProvider(config, admission=admission, history_cache=history_cache)
 
     return construct
 
@@ -86,8 +131,27 @@ def _load_deepseek() -> ProviderFactory:
         config: ProviderConfig,
         settings: Settings,
         admission: ProviderAdmissionController,
+        history_cache: HistoryModeCache | None = None,
     ) -> BaseProvider:
-        return DeepSeekProvider(config, admission=admission)
+        return DeepSeekProvider(
+            config, admission=admission, history_cache=history_cache
+        )
+
+    return construct
+
+
+def _load_alibaba_cloud() -> ProviderFactory:
+    from free_claude_code.providers.alibaba_cloud import AlibabaCloudProvider
+
+    def construct(
+        config: ProviderConfig,
+        settings: Settings,
+        admission: ProviderAdmissionController,
+        history_cache: HistoryModeCache | None = None,
+    ) -> BaseProvider:
+        return AlibabaCloudProvider(
+            config, admission=admission, history_cache=history_cache
+        )
 
     return construct
 
@@ -99,8 +163,11 @@ def _load_lmstudio() -> ProviderFactory:
         config: ProviderConfig,
         settings: Settings,
         admission: ProviderAdmissionController,
+        history_cache: HistoryModeCache | None = None,
     ) -> BaseProvider:
-        return LMStudioProvider(config, admission=admission)
+        return LMStudioProvider(
+            config, admission=admission, history_cache=history_cache
+        )
 
     return construct
 
@@ -112,11 +179,13 @@ def _load_cloudflare() -> ProviderFactory:
         config: ProviderConfig,
         settings: Settings,
         admission: ProviderAdmissionController,
+        history_cache: HistoryModeCache | None = None,
     ) -> BaseProvider:
         return CloudflareProvider(
             config,
             account_id=_required_setting(settings, "cloudflare_account_id"),
             admission=admission,
+            history_cache=history_cache,
         )
 
     return construct
@@ -129,8 +198,9 @@ def _load_gemini() -> ProviderFactory:
         config: ProviderConfig,
         settings: Settings,
         admission: ProviderAdmissionController,
+        history_cache: HistoryModeCache | None = None,
     ) -> BaseProvider:
-        return GeminiProvider(config, admission=admission)
+        return GeminiProvider(config, admission=admission, history_cache=history_cache)
 
     return construct
 
@@ -142,12 +212,14 @@ def _load_vertex() -> ProviderFactory:
         config: ProviderConfig,
         settings: Settings,
         admission: ProviderAdmissionController,
+        history_cache: HistoryModeCache | None = None,
     ) -> BaseProvider:
         return VertexProvider(
             config,
             project_id=_required_setting(settings, "vertex_project_id"),
             location=settings.vertex_location,
             admission=admission,
+            history_cache=history_cache,
         )
 
     return construct
@@ -160,8 +232,9 @@ def _load_groq() -> ProviderFactory:
         config: ProviderConfig,
         settings: Settings,
         admission: ProviderAdmissionController,
+        history_cache: HistoryModeCache | None = None,
     ) -> BaseProvider:
-        return GroqProvider(config, admission=admission)
+        return GroqProvider(config, admission=admission, history_cache=history_cache)
 
     return construct
 
@@ -173,8 +246,11 @@ def _load_opencode_zen() -> ProviderFactory:
         config: ProviderConfig,
         settings: Settings,
         admission: ProviderAdmissionController,
+        history_cache: HistoryModeCache | None = None,
     ) -> BaseProvider:
-        return create_opencode_provider("opencode_zen", config, admission)
+        return create_opencode_provider(
+            "opencode_zen", config, admission, history_cache=history_cache
+        )
 
     return construct
 
@@ -186,15 +262,21 @@ def _load_opencode_go() -> ProviderFactory:
         config: ProviderConfig,
         settings: Settings,
         admission: ProviderAdmissionController,
+        history_cache: HistoryModeCache | None = None,
     ) -> BaseProvider:
-        return create_opencode_provider("opencode_go", config, admission)
+        return create_opencode_provider(
+            "opencode_go", config, admission, history_cache=history_cache
+        )
 
     return construct
 
 
 _SPECIAL_PROVIDER_FACTORIES: dict[str, Callable[[], ProviderFactory]] = {
+    "anthropic": _load_anthropic,
+    "alibaba_cloud": _load_alibaba_cloud,
     "nvidia_nim": _load_nvidia_nim,
     "open_router": _load_open_router,
+    "openai_api": _load_openai_api,
     "mistral": _load_mistral,
     "kilo": _load_kilo,
     "deepseek": _load_deepseek,
@@ -235,12 +317,39 @@ if (
 def prepare_provider(
     provider_id: str,
     provider_loaders: Mapping[str, Callable[[], ProviderFactory]],
-) -> Callable[[Settings], BaseProvider]:
+    custom_definition: CustomProviderDefinition | None = None,
+    *,
+    api_key_number: int = 1,
+) -> Callable[
+    [Settings, ProviderAdmissionRegistry, HistoryModeCache | None], BaseProvider
+]:
     """Load implementation modules in a worker; return a loop-owned constructor."""
 
     # The SDK lazily imports these on first client resource access. Keep that
     # work in this loader, before constructing clients on their owner loop.
     importlib.import_module("openai.resources")
+    if custom_definition is not None:
+        from free_claude_code.providers.custom import CustomProvider
+
+        from .config import build_custom_provider_config
+
+        def construct_custom(
+            settings: Settings,
+            admission_registry: ProviderAdmissionRegistry,
+            history_cache: HistoryModeCache | None = None,
+        ) -> BaseProvider:
+            config = build_custom_provider_config(
+                custom_definition, settings, api_key_number=api_key_number
+            )
+            admission = admission_registry.get(provider_id, api_key=config.api_key)
+            return CustomProvider(
+                config,
+                definition=custom_definition,
+                admission=admission,
+                history_cache=history_cache,
+            )
+
+        return construct_custom
     descriptor = PROVIDER_CATALOG.get(provider_id)
     if descriptor is None:
         raise UnknownProviderError.for_provider(provider_id, PROVIDER_CATALOG)
@@ -253,16 +362,28 @@ def prepare_provider(
         )
     factory = loader() if loader is not None else None
 
-    def construct(settings: Settings) -> BaseProvider:
-        config = build_provider_config(descriptor, settings)
-        admission = ProviderAdmissionController(
-            provider_name=provider_id,
-            rate_limit=config.rate_limit,
-            rate_window=config.rate_window,
-            max_concurrency=config.max_concurrency,
+    def construct(
+        settings: Settings,
+        admission_registry: ProviderAdmissionRegistry,
+        history_cache: HistoryModeCache | None = None,
+    ) -> BaseProvider:
+        config = build_provider_config(
+            descriptor, settings, api_key_number=api_key_number
         )
+        admission = admission_registry.get(provider_id, api_key=config.api_key)
         if factory is not None:
-            return factory(config, settings, admission)
-        return create_openai_chat_provider(provider_id, config, admission)
+            provider = factory(config, settings, admission, history_cache)
+            if (
+                descriptor.native_messages_passthrough
+                and type(provider).stream_native_messages
+                is BaseProvider.stream_native_messages
+            ):
+                raise AssertionError(
+                    f"Provider {provider_id!r} lacks native Messages execution"
+                )
+            return provider
+        return create_openai_chat_provider(
+            provider_id, config, admission, history_cache
+        )
 
     return construct

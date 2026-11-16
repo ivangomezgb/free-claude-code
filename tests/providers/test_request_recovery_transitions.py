@@ -4,18 +4,24 @@ import asyncio
 import json
 from contextlib import asynccontextmanager
 from copy import deepcopy
-from io import StringIO
 from unittest.mock import patch
 
 import httpx
 import httpx2
 import pytest
 from openai import AsyncOpenAI
+from starlette.responses import StreamingResponse
 
+from free_claude_code.api.response_streams import (
+    anthropic_sse_streaming_response,
+    openai_responses_sse_streaming_response,
+)
+from free_claude_code.application.response_collection import collect_response
 from free_claude_code.core.anthropic import ReasoningReplayMode
 from free_claude_code.core.anthropic.models import MessagesRequest
 from free_claude_code.core.anthropic.stream_contracts import parse_sse_text
 from free_claude_code.core.failures import ExecutionFailure
+from free_claude_code.core.openai_responses import OpenAIResponsesRequest
 from free_claude_code.core.reasoning import ReasoningPolicy
 from free_claude_code.providers.admission import (
     ProviderAdmissionController,
@@ -29,6 +35,8 @@ from free_claude_code.providers.openai_chat import (
     OpenAIChatRequestPolicy,
 )
 from free_claude_code.providers.openai_responses import OpenAIResponsesTransport
+from tests.api.test_hidden_stream_retries import delivered
+from tests.api.test_response_streams import _json_error, _serve
 from tests.providers.support import make_provider_config
 from tests.providers.test_anthropic_messages_transport import _events
 from tests.providers.test_anthropic_messages_transport import (
@@ -222,6 +230,118 @@ def _partial(protocol, text=""):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("protocol", ["chat", "messages"])
+@pytest.mark.parametrize(
+    "wire,failure_kind",
+    [
+        ("messages", "authentication"),
+        ("responses", "authentication"),
+        ("messages", "history"),
+        ("messages", "reasoning"),
+    ],
+)
+@pytest.mark.parametrize("stopped,public", [(True, True), (False, True), (True, False)])
+async def test_hidden_normal_stop_prevents_request_corrections(
+    protocol, wire, failure_kind, stopped, public
+):
+    error = (
+        {
+            "type": "authentication_error",
+            "code": "invalid_api_key",
+            "message": "expired",
+        }
+        if failure_kind == "authentication"
+        else _history_error(protocol)
+        if failure_kind == "history"
+        else _reasoning_error()
+    )
+    events = _partial(protocol)
+    if stopped:
+        if protocol == "messages":
+            events.append(
+                {
+                    "type": "message_delta",
+                    "delta": {"stop_reason": "end_turn"},
+                    "usage": {"output_tokens": 0},
+                }
+            )
+        else:
+            terminal = deepcopy(events[0])
+            terminal["choices"][0].update(delta={}, finish_reason="stop")
+            events.append(terminal)
+    events.append({"type": "error", "error": error})
+
+    async with _transport(
+        protocol,
+        lambda ordinal: (200, events if ordinal == 1 else _events_for(protocol)),
+    ) as (provider, endpoint, bodies, wires, admission):
+        if wire == "messages":
+            source = _stream(provider, endpoint, _request(protocol))
+        else:
+            source = provider.stream_responses(
+                OpenAIResponsesRequest(model="upstream", input="continue"),
+                endpoint_context=endpoint,
+                reasoning=ReasoningPolicy.prefer_off(),
+                response_model="public",
+            )
+        if public:
+            options = {"pre_start_error_response": _json_error, "request_id": "stopped"}
+            response = await (
+                anthropic_sse_streaming_response(
+                    source, pre_start_error_response=_json_error, request_id="stopped"
+                )
+                if wire == "messages"
+                else openai_responses_sse_streaming_response(
+                    source, headers={}, **options
+                )
+            )
+            if isinstance(response, StreamingResponse):
+                sent = await _serve(response)
+                if stopped:
+                    result = b"".join(
+                        message.get("body", b"") for message in sent
+                    ).decode()
+                    assert error["message"] in result
+                    assert parse_sse_text(result)[-1].event in {
+                        "error",
+                        "response.failed",
+                    }
+            elif stopped:
+                assert response.status_code >= 400
+                assert error["message"] in bytes(response.body).decode()
+            else:
+                assert isinstance(response, StreamingResponse)
+        else:
+            if stopped:
+                with pytest.raises(ExecutionFailure):
+                    await collect_response(source, protocol=wire)
+            else:
+                output = "".join(await collect_response(source, protocol=wire))
+                assert parse_sse_text(output)[-1].event == (
+                    "message_stop" if wire == "messages" else "response.completed"
+                )
+        calls = 1 if stopped else 2
+        assert len(bodies) == calls
+        assert all(item.close_calls == 1 for item in wires)
+        assert not admission._episodes
+        assert endpoint.calls == (
+            [False, True]
+            if calls == 2 and failure_kind == "authentication"
+            else [False] * calls
+        )
+        if calls == 2:
+            first, second = bodies
+            if failure_kind == "authentication":
+                assert first == second
+            elif failure_kind == "history":
+                assert "opaque-original" in json.dumps(first)
+                assert "opaque-original" not in json.dumps(second)
+            else:
+                field = "thinking" if protocol == "messages" else "reasoning_effort"
+                assert field in first and field not in second
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("protocol", ["chat", "responses", "messages"])
 @pytest.mark.parametrize("exhausted", [False, True])
 async def test_mixed_recovery_keeps_one_budget_and_correction_history(
@@ -248,10 +368,14 @@ async def test_mixed_recovery_keeps_one_budget_and_correction_history(
                 with pytest.raises(ExecutionFailure):
                     _ = [event async for event in _stream(provider, endpoint, request)]
             else:
-                output = [event async for event in _stream(provider, endpoint, request)]
+                output = await collect_response(
+                    _stream(provider, endpoint, request), protocol="messages"
+                )
                 parsed = parse_sse_text("".join(output))
                 assert sum(event.event == "message_start" for event in parsed) == 1
-                assert sum(event.event == "message_stop" for event in parsed) == 1
+                assert sum(event.event == "message_stop" for event in parsed) == 1, (
+                    parsed[-1]
+                )
         starts = [
             call.kwargs
             for call in trace.call_args_list
@@ -318,24 +442,12 @@ async def test_credential_resolution_preserves_admission_order(protocol, refresh
         wires,
         _,
     ):
-        if protocol == "responses":
-            with pytest.raises(
-                ExecutionFailure, match="credential service unavailable"
-            ):
-                _ = [
-                    event
-                    async for event in _stream(provider, endpoint, _request(protocol))
-                ]
-            assert endpoint.calls == ([False, True] if refresh else [False])
-            assert len(bodies) == int(refresh)
-        else:
-            assert [
+        with pytest.raises(ExecutionFailure, match="credential service unavailable"):
+            _ = [
                 event async for event in _stream(provider, endpoint, _request(protocol))
             ]
-            assert endpoint.calls == (
-                [False, True, True] if refresh else [False, False]
-            )
-            assert len(bodies) == 1 + int(refresh)
+        assert endpoint.calls == ([False, True] if refresh else [False])
+        assert len(bodies) == int(refresh)
         assert all(wire.close_calls == 1 for wire in wires)
 
 
@@ -363,11 +475,11 @@ async def test_committed_output_prevents_generation_corrections(protocol, failur
         wires,
         _,
     ):
-        output = StringIO()
-        with pytest.raises(ExecutionFailure):
-            async for event in _stream(provider, endpoint, _request(protocol)):
-                output.write(event)
-        assert "already visible" in output.getvalue()
+        output = await delivered(
+            _stream(provider, endpoint, _request(protocol)), "messages"
+        )
+        assert parse_sse_text(output)[-1].event == "error"
+        assert "already visible" in output
         assert len(bodies) == 1 and endpoint.calls == [False]
         assert all(wire.close_calls == 1 for wire in wires)
 
@@ -431,23 +543,25 @@ async def test_committed_chat_continuation_has_separate_body_correction_scope(
                 "type": "invalid_request_error",
                 "message": "stream_options is unsupported",
             }
-        return 200, _events_for("chat")
+        completed = _partial("chat", "completed")
+        completed[-1]["choices"][0]["finish_reason"] = "stop"
+        return 200, completed
 
     async with _transport("chat", respond) as (provider, endpoint, bodies, wires, _):
-        output = StringIO()
+        output = await delivered(
+            _stream(provider, endpoint, _request("chat")), "messages"
+        )
+        parsed = parse_sse_text(output)
         if failure_kind == "authentication":
-            with pytest.raises(ExecutionFailure):
-                async for event in _stream(provider, endpoint, _request("chat")):
-                    output.write(event)
+            assert parsed[-1].event == "error"
             assert len(bodies) == 2
         else:
-            async for event in _stream(provider, endpoint, _request("chat")):
-                output.write(event)
             assert len(bodies) == 3
             assert bodies[1]["stream_options"] == {"include_usage": True}
             assert "stream_options" not in bodies[2]
-            parsed = parse_sse_text(output.getvalue())
-            assert sum(event.event == "message_stop" for event in parsed) == 1
-        assert "already visible" in output.getvalue()
+            assert sum(event.event == "message_stop" for event in parsed) == 1, parsed[
+                -1
+            ]
+        assert "already visible" in output
         assert endpoint.calls == [False] * len(bodies)
         assert all(wire.close_calls == 1 for wire in wires)

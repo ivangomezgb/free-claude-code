@@ -2,10 +2,12 @@ import json
 from collections.abc import AsyncIterator
 from unittest.mock import MagicMock, patch
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
 from free_claude_code.application.errors import InvalidRequestError
+from free_claude_code.application.model_metadata import ProviderModelInfo
 from free_claude_code.config.constants import DEFAULT_MODEL
 from free_claude_code.config.settings import Settings
 from free_claude_code.core.anthropic import ReasoningReplayMode
@@ -18,18 +20,54 @@ from free_claude_code.core.reasoning import (
     ReasoningEffort,
     ReasoningPolicy,
 )
+from free_claude_code.core.stream_output import StreamOutput
 from free_claude_code.providers.openai_chat import (
     NO_REASONING,
     OpenAIChatProfile,
     OpenAIChatProvider,
     OpenAIChatRequestPolicy,
 )
-from tests.api.support import create_test_app
+from tests.api.support import create_test_app, provider_manager_for_app
 from tests.providers.support import immediate_admission, make_provider_config
+from tests.providers.test_custom_provider import completion, definition
+from tests.providers.test_custom_provider import provider as custom_provider
 
 _PUBLIC_MODEL = "nvidia_nim/test-model"
 _UPSTREAM_MODEL = "test-model"
 _RESPONSE_ID = "resp_test"
+
+
+def test_responses_route_carries_generation_model_limit_to_messages_egress():
+    bodies = []
+
+    def reply(request):
+        bodies.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            text=completion("anthropic_messages"),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    config = definition(api_format="anthropic_messages")
+    instance = custom_provider(config, messages_handler=reply)
+    app = create_test_app(
+        Settings(custom_providers=(config,)), providers={config.provider_id: instance}
+    )
+    provider_manager_for_app(app).cache_model_infos(
+        config.provider_id, {ProviderModelInfo("m", max_output_tokens=4096)}
+    )
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/responses",
+            json={
+                "model": f"{config.provider_id}/m",
+                "input": "Hello",
+                "max_output_tokens": 8192,
+            },
+        )
+    assert response.status_code == 200
+    assert "response.completed" in response.text
+    assert bodies[0]["max_tokens"] == 4096
 
 
 class FakeProvider:
@@ -43,13 +81,13 @@ class FakeProvider:
         self,
         request_data: OpenAIResponsesRequest,
         **kwargs: object,
-    ) -> AsyncIterator[str]:
+    ) -> AsyncIterator[StreamOutput]:
         if self.startup_error is not None:
             raise self.startup_error
         self.requests.append(request_data)
         self.stream_kwargs.append(kwargs)
         for chunk in self.chunks:
-            yield chunk
+            yield StreamOutput((chunk,))
 
 
 class PreStartFailingProvider(FakeProvider):
@@ -60,7 +98,7 @@ class PreStartFailingProvider(FakeProvider):
         self,
         request_data: OpenAIResponsesRequest,
         **kwargs: object,
-    ) -> AsyncIterator[str]:
+    ) -> AsyncIterator[StreamOutput]:
         self.requests.append(request_data)
         self.stream_kwargs.append(kwargs)
         raise ExecutionFailure(
@@ -69,7 +107,7 @@ class PreStartFailingProvider(FakeProvider):
             message="upstream is busy",
             retryable=True,
         )
-        yield "unreachable"
+        yield StreamOutput(("unreachable",))
 
 
 @pytest.fixture
@@ -93,13 +131,23 @@ def test_responses_probe_endpoints_return_204(
 
 
 @pytest.mark.parametrize("prefix", ["", "anthropic/", "claude-3-freecc-no-thinking/"])
-def test_retired_response_id_uses_default_provider(responses_client, prefix):
+@pytest.mark.parametrize(
+    "ref,upstream",
+    [
+        ("github_models/vendor/opus", DEFAULT_MODEL.split("/", 1)[1]),
+        (
+            "nvidia_nim/nvidia/nemotron-3-super-120b-a12b",
+            "nvidia/nemotron-3-ultra-550b-a55b",
+        ),
+    ],
+)
+def test_retired_response_id_uses_replacement(responses_client, prefix, ref, upstream):
     client, provider = responses_client
-    original = f"{prefix}github_models/vendor/opus"
+    original = f"{prefix}{ref}"
     response = client.post("/v1/responses", json={"model": original, "input": "hello"})
     assert response.status_code == 200
     assert "response.completed" in response.text
-    assert provider.requests[0].model == DEFAULT_MODEL.split("/", 1)[1]
+    assert provider.requests[0].model == upstream
     assert provider.stream_kwargs[0]["response_model"] == original
     if prefix == "claude-3-freecc-no-thinking/":
         assert provider.stream_kwargs[0]["reasoning"] == ReasoningPolicy.off()
@@ -203,7 +251,7 @@ def test_create_response_rejects_unportable_image_as_invalid_request() -> None:
             profile=OpenAIChatProfile(
                 OpenAIChatRequestPolicy(
                     provider_name="TEST_CHAT",
-                    reasoning_replay=ReasoningReplayMode.DISABLED,
+                    reasoning_replay=ReasoningReplayMode.REASONING_CONTENT,
                 ),
                 NO_REASONING,
             ),
@@ -314,15 +362,11 @@ def test_create_response_relays_provider_owned_post_start_failure() -> None:
     assert events[-1].data["response"]["error"]["message"] == "socket closed"
 
 
-def test_create_response_stream_bypasses_local_message_optimizations() -> None:
+def test_create_response_stream_forwards_quota_prompt() -> None:
     provider = FakeProvider(_responses_text_stream("Provider response"))
     app = create_test_app()
     with (
         patch("free_claude_code.api.routes.resolve_provider", return_value=provider),
-        patch(
-            "free_claude_code.api.handlers.messages.try_optimizations",
-            side_effect=AssertionError("Responses must not use message optimizations"),
-        ),
         TestClient(app) as client,
     ):
         response = client.post(

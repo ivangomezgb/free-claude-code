@@ -58,6 +58,9 @@ def test_opencode_config_uses_native_responses_and_model_budgets() -> None:
     assert fcc["settings"] == {
         "baseURL": "http://127.0.0.1:9191/v1",
         "apiKey": "{env:FCC_OPENCODE_API_KEY}",
+        "headerTimeout": False,
+        "chunkTimeout": False,
+        "timeout": False,
     }
     assert fcc["models"] == {
         "nvidia_nim/vendor/model": {
@@ -76,10 +79,11 @@ def test_opencode_config_uses_native_responses_and_model_budgets() -> None:
         },
         "future_provider/unknown-model": {
             "name": "Unknown model",
+            "limit": {"context": 200000},
         },
         "future_provider/output-only": {
             "name": "Output-only model",
-            "limit": {"output": 4096},
+            "limit": {"context": 200000, "output": 4096},
         },
     }
     assert config.overlay == {
@@ -91,6 +95,9 @@ def test_opencode_config_uses_native_responses_and_model_budgets() -> None:
                 "settings": {
                     "baseURL": "http://127.0.0.1:9191/v1",
                     "apiKey": "{env:FCC_OPENCODE_API_KEY}",
+                    "headerTimeout": False,
+                    "chunkTimeout": False,
+                    "timeout": False,
                 },
             }
         },
@@ -120,8 +127,8 @@ def test_opencode_config_uses_native_responses_and_model_budgets() -> None:
         (16384, 1024, {"context": 16384, "output": 1024}, 4096),
         (131072, 65536, {"context": 131072, "output": 65536}, None),
         (200000, None, {"context": 200000, "output": 4096}, None),
-        (None, 4096, {"output": 4096}, None),
-        (None, None, None, None),
+        (None, 4096, {"context": 200000, "output": 4096}, None),
+        (None, None, {"context": 200000}, None),
     ],
 )
 def test_opencode_context_reserves_fit_small_models(
@@ -175,6 +182,9 @@ def test_opencode_child_receives_private_catalog_and_overlay(launch_capture) -> 
         overlay = json.loads(env["OPENCODE_CONFIG_CONTENT"])
         provider = config["providers"]["free-claude-code"]
         assert provider["settings"]["baseURL"] == "http://127.0.0.1:8182/v1"
+        for key in ("headerTimeout", "chunkTimeout", "timeout"):
+            assert provider["settings"][key] is False
+            assert overlay["providers"]["free-claude-code"]["settings"][key] is False
         assert "nvidia_nim/catalog-model:variant" in provider["models"]
         assert overlay["experimental"]["policies"][-1]["resource"] == "free-claude-code"
         assert env["FCC_OPENCODE_API_KEY"] == "launcher-test-token"

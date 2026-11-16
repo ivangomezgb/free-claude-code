@@ -33,6 +33,13 @@ ALLOWED_PACKAGE_DEPENDENCIES: dict[str, set[str]] = {
 
 IMPORT_EXCEPTIONS: dict[tuple[str, str], str] = {
     (
+        "free_claude_code.cli.doctor",
+        "free_claude_code.runtime.diagnostics",
+    ): (
+        "Owner: installed diagnostic command. "
+        "Reason: read-only report composition owns provider and harness inspection."
+    ),
+    (
         "free_claude_code.cli.commands",
         "free_claude_code.runtime.bootstrap",
     ): (
@@ -42,12 +49,19 @@ IMPORT_EXCEPTIONS: dict[tuple[str, str], str] = {
 }
 
 FACADE_ONLY_BOUNDARIES = {
+    "free_claude_code.application.model_fallback",
     "free_claude_code.core.openai_responses",
+    "free_claude_code.messaging.delivery_failures",
     "free_claude_code.messaging.trees",
+    "free_claude_code.providers.attempt_loop",
+    "free_claude_code.providers.failure_classification",
     "free_claude_code.providers.openai_chat",
+    "free_claude_code.providers.recovery_policy",
+    "free_claude_code.providers.request_correction",
+    "free_claude_code.providers.stream_failure_resolution",
 }
 
-OPTIONAL_IMPORT_OWNERS = {
+DEFERRED_IMPORT_OWNERS = {
     "librosa": "free_claude_code.messaging.transcription",
     "torch": "free_claude_code.messaging.transcription",
     "transformers": "free_claude_code.messaging.transcription",
@@ -141,11 +155,8 @@ def test_api_configuration_access_goes_through_runtime() -> None:
     )
 
 
-def test_request_recovery_policy_has_no_client_or_transport_binding() -> None:
-    owners = {
-        f"{_PACKAGE_NAME}.providers.request_recovery",
-        f"{_PACKAGE_NAME}.providers.endpoint",
-    }
+def test_request_endpoint_has_no_client_or_transport_binding() -> None:
+    owners = {f"{_PACKAGE_NAME}.providers.endpoint"}
     forbidden = (
         "openai",
         "httpx",
@@ -164,8 +175,141 @@ def test_request_recovery_policy_has_no_client_or_transport_binding() -> None:
             for prefix in forbidden
         )
     ]
+    assert not offenders, "Request endpoint depends on an adapter:\n" + "\n".join(
+        offenders
+    )
+
+
+def test_failure_classification_is_pure() -> None:
+    owner = f"{_PACKAGE_NAME}.providers.failure_classification"
+    forbidden = (
+        "asyncio",
+        "datetime",
+        "logging",
+        "loguru",
+        "random",
+        "time",
+        f"{_PACKAGE_NAME}.core.trace",
+        f"{_PACKAGE_NAME}.providers.admission",
+        f"{_PACKAGE_NAME}.providers.failure_reporting",
+        f"{_PACKAGE_NAME}.providers.http",
+    )
+    offenders = [
+        record.describe()
+        for record in _scan_imports(_PACKAGE_ROOT)
+        if (record.importer == owner or record.importer.startswith(f"{owner}."))
+        and any(
+            record.imported == prefix or record.imported.startswith(f"{prefix}.")
+            for prefix in forbidden
+        )
+    ]
     assert not offenders, (
-        "Request recovery policy depends on an adapter:\n" + "\n".join(offenders)
+        "Failure classification must not log, sleep, read clocks, or own recovery:\n"
+        + "\n".join(offenders)
+    )
+
+
+def test_stream_failure_resolution_is_pure() -> None:
+    owner = f"{_PACKAGE_NAME}.providers.stream_failure_resolution"
+    offenders = [
+        record.describe()
+        for record in _scan_imports(_PACKAGE_ROOT)
+        if (record.importer == owner or record.importer.startswith(f"{owner}."))
+        and record.imported.split(".")[0] != "enum"
+        and not record.imported.startswith(f"{owner}.")
+    ]
+    assert not offenders, (
+        "Stream failure resolution must depend on nothing but its inputs:\n"
+        + "\n".join(offenders)
+    )
+
+
+def test_request_correction_decides_without_effects() -> None:
+    owner = f"{_PACKAGE_NAME}.providers.request_correction"
+    forbidden = (
+        "logging",
+        "loguru",
+        f"{_PACKAGE_NAME}.core.trace",
+        f"{_PACKAGE_NAME}.providers.admission",
+        f"{_PACKAGE_NAME}.providers.history_negotiation",
+        f"{_PACKAGE_NAME}.providers.http",
+    )
+    offenders = [
+        record.describe()
+        for record in _scan_imports(_PACKAGE_ROOT)
+        if (record.importer == owner or record.importer.startswith(f"{owner}."))
+        and any(
+            record.imported == prefix or record.imported.startswith(f"{prefix}.")
+            for prefix in forbidden
+        )
+    ]
+    assert not offenders, (
+        "Request correction must return lessons, not log or teach memories:\n"
+        + "\n".join(offenders)
+    )
+
+
+def test_model_fallback_decision_is_pure() -> None:
+    owner = f"{_PACKAGE_NAME}.application.model_fallback.decision"
+    allowed = {"collections", "dataclasses", f"{_PACKAGE_NAME}.core.stream_recovery"}
+    offenders = [
+        record.describe()
+        for record in _scan_imports(_PACKAGE_ROOT)
+        if record.importer == owner
+        and not any(
+            record.imported == prefix or record.imported.startswith(f"{prefix}.")
+            for prefix in allowed
+        )
+    ]
+    assert not offenders, (
+        "Model fallback decisions must depend on nothing but recovery evidence:\n"
+        + "\n".join(offenders)
+    )
+
+
+def test_recovery_policy_is_pure() -> None:
+    owner = f"{_PACKAGE_NAME}.providers.recovery_policy"
+    # datetime and email.utils parse HTTP-date hints; the caller passes "now".
+    allowed = {"dataclasses", "datetime", "email.utils", "math", owner}
+    offenders = [
+        record.describe()
+        for record in _scan_imports(_PACKAGE_ROOT)
+        if (record.importer == owner or record.importer.startswith(f"{owner}."))
+        and not any(
+            record.imported == prefix or record.imported.startswith(f"{prefix}.")
+            for prefix in allowed
+        )
+    ]
+    clock_reads = {"now", "today", "utcnow"}
+    for path in (_PACKAGE_ROOT / "providers" / "recovery_policy").glob("*.py"):
+        offenders.extend(
+            f"{path.name}:{node.lineno}: reads the clock"
+            for node in ast.walk(ast.parse(path.read_text()))
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in clock_reads
+        )
+    assert not offenders, (
+        "Recovery policy must take its clock and jitter as arguments:\n"
+        + "\n".join(offenders)
+    )
+
+
+def test_delivery_failures_is_pure() -> None:
+    owner = f"{_PACKAGE_NAME}.messaging.delivery_failures"
+    allowed = {"dataclasses", "enum", owner}
+    offenders = [
+        record.describe()
+        for record in _scan_imports(_PACKAGE_ROOT)
+        if (record.importer == owner or record.importer.startswith(f"{owner}."))
+        and not any(
+            record.imported == prefix or record.imported.startswith(f"{prefix}.")
+            for prefix in allowed
+        )
+    ]
+    assert not offenders, (
+        "Delivery failure rules must not reach a platform, the loop or a clock:\n"
+        + "\n".join(offenders)
     )
 
 
@@ -207,6 +351,8 @@ def test_native_model_catalog_has_no_http_formatter_or_decoder_dependency() -> N
         f"{_PACKAGE_NAME}.runtime.codex_app_server",
         f"{_PACKAGE_NAME}.runtime.codex_catalog",
         f"{_PACKAGE_NAME}.harnesses.codex_model_catalog",
+        f"{_PACKAGE_NAME}.harnesses.vscode_chat_integration",
+        f"{_PACKAGE_NAME}.harnesses.model_policy",
     }
     offenders = [
         record.describe()
@@ -657,24 +803,24 @@ def test_providers_do_not_own_wire_error_type_literals() -> None:
     assert sorted(offenders) == []
 
 
-def test_optional_dependencies_have_one_lazy_owner() -> None:
+def test_transcription_dependencies_have_one_lazy_owner() -> None:
     seen: set[str] = set()
     offenders: list[str] = []
     for record in _scan_imports(_PACKAGE_ROOT):
         dependency = record.imported.split(".", 1)[0]
-        owner = OPTIONAL_IMPORT_OWNERS.get(dependency)
+        owner = DEFERRED_IMPORT_OWNERS.get(dependency)
         if owner is None:
             continue
         seen.add(dependency)
         if record.importer != owner or not record.inside_function:
             offenders.append(record.describe())
 
-    assert seen == set(OPTIONAL_IMPORT_OWNERS)
+    assert seen == set(DEFERRED_IMPORT_OWNERS)
     assert sorted(offenders) == []
 
 
-def test_runtime_imports_without_optional_voice_dependencies() -> None:
-    blocked = sorted(OPTIONAL_IMPORT_OWNERS)
+def test_runtime_imports_without_loading_transcription_dependencies() -> None:
+    blocked = sorted(DEFERRED_IMPORT_OWNERS)
     script = "\n".join(
         (
             "import importlib.abc",

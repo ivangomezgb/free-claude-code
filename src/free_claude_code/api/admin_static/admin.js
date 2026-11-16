@@ -11,12 +11,15 @@ const state = {
   authStatuses: new Map(),
   providerChecks: new Map(),
   providerId: null,
+  customProvider: null,
+  configRefreshRequired: false,
+  modelLabels: new Map(),
   localStatusRequest: null,
   startup: null,
   startupRequest: null,
   startupTimer: null,
   startupAgain: false,
-  codeCatalogRetry: false,
+  configRequest: 0,
   modelOptionsRequest: 0,
   activeView: viewFromLocation(),
 };
@@ -35,7 +38,7 @@ const VIEW_GROUPS = [
     id: "model_config",
     label: "Model Config",
     title: "Model Config",
-    sections: ["models", "reasoning", "web_tools"],
+    sections: ["models", "web_tools"],
     containerId: "modelConfigSections",
   },
   {
@@ -121,12 +124,12 @@ function renderStartup() {
   const message = byId("startupMessage");
   if (message) {
     const messaging = startup?.messaging;
-    const visible = state.activeView === "messaging" && ["starting", "failed"].includes(messaging?.state);
+    const visible = state.activeView === "messaging" && (["starting", "failed"].includes(messaging?.state) || Boolean(messaging?.warning));
     message.hidden = !visible;
     message.classList.toggle("startup-spinner", visible && messaging.state === "starting");
     message.classList.toggle("error", messaging?.state === "failed");
-    message.textContent = messaging?.state === "failed" ? messaging.message || "Messaging could not start." : "";
-    message.setAttribute("aria-label", "Messaging is starting");
+    message.textContent = messaging?.state === "failed" ? messaging.message || "Messaging could not start." : messaging?.warning || "";
+    message.setAttribute("aria-label", messaging?.state === "starting" ? "Messaging is starting" : "Messaging status");
   }
   if (!startup) return;
   document.querySelectorAll("[data-startup-provider]").forEach((button) => {
@@ -139,9 +142,11 @@ function renderStartup() {
     renderProviderCheckResult(provider.provider_id);
   });
   renderClaudeIntegration();
+  renderVSCodeChatIntegration();
   renderJetBrainsIntegration();
   renderCodexIntegration();
   renderClaudeDesktopIntegration();
+  renderDshDesktopIntegration();
 }
 
 async function refreshStartup() {
@@ -172,8 +177,8 @@ async function refreshStartup() {
     const changed = !previous || previous.instance_id !== result.instance_id ||
       JSON.stringify(previous.startup) !== JSON.stringify(current);
     if (changed) void hydrateModelOptions();
-    if (changed || state.codeCatalogRetry) state.codeCatalogRetry = await window.CodeSessions?.refresh(result) === false;
-    pending = state.codeCatalogRetry || current.catalog === "starting" || current.catalog_file === "starting" ||
+    if (changed) void window.CodeSessions?.refresh(result);
+    pending = current.catalog === "starting" || current.catalog_file === "starting" ||
       current.code?.state === "starting" || current.messaging?.state === "starting" ||
       Object.values(current.integrations || {}).some((update) => update.state === "starting") ||
       Object.values(current.providers || {}).includes("starting");
@@ -204,26 +209,32 @@ window.addEventListener("pagehide", () => {
 });
 
 async function load({ providersOnly = false } = {}) {
+  const request = ++state.configRequest;
   state.localStatusRequest = null;
   state.startupRequest?.controller.abort();
   state.startupRequest = null;
   showMessage("Loading admin config");
   const config = await api("/admin/api/config");
+  if (request !== state.configRequest) return;
+  config.custom_providers ||= [];
+  config.provider_status.push(...config.custom_providers.map((provider) => ({ ...provider, kind: "custom", status: "configured", settings_keys: [], missing_configuration_keys: [] })));
   state.config = config;
+  state.configRefreshRequired = false;
+  window.CodeSessions.setProviderNames(config.custom_providers);
   state.startup = null;
   state.fields = new Map(config.fields.map((field) => [field.key, field]));
   if (!providersOnly) renderNav();
   state.providerChecks.clear();
   renderProviders(config.provider_status);
   if (!providersOnly) renderSections(config.sections, config.fields);
+  document.querySelectorAll(".model-list-editor").forEach((element) => element.modelListEditor.refreshKeyOptions());
   byId("configPath").textContent = config.paths.managed;
   void refreshLocalStatus(config);
   void refreshStartup();
-  await Promise.all([
-    refreshConnectedAccounts(),
-    hydrateModelOptions(),
-    providersOnly ? window.CodeSessions.refresh() : window.CodeSessions.initialize(api),
-  ]);
+  void refreshConnectedAccounts();
+  void hydrateModelOptions();
+  if (providersOnly) void window.CodeSessions.refresh();
+  else window.CodeSessions.initialize(api);
   if (state.config !== config) return;
   updateDirtyState();
   showMessage("");
@@ -255,7 +266,7 @@ function setActiveView(viewId, { scroll = false } = {}) {
   state.activeView = activeView.id;
   byId("pageTitle").textContent = activeView.title;
   renderStartup();
-  if (activeView.id === "code") state.codeCatalogRetry = true;
+  if (activeView.id === "code") void window.CodeSessions.refresh();
   void refreshStartup();
   const sessionActive = activeView.id === "code";
   document.querySelector(".app-shell").classList.toggle("session-active", sessionActive);
@@ -286,9 +297,12 @@ function setActiveView(viewId, { scroll = false } = {}) {
   else window.CodeSessions.deactivate();
   if (activeView.id === "integrations") {
     refreshClaudeIntegration();
+    refreshClaudeOnboarding();
+    refreshVSCodeChatIntegration();
     refreshJetBrainsIntegration();
     refreshCodexIntegration();
     refreshClaudeDesktopIntegration();
+    refreshDshDesktopIntegration();
   }
 }
 
@@ -334,6 +348,25 @@ function renderProviders(providerStatus) {
     });
     container.appendChild(group);
   });
+  const custom = document.createElement("section");
+  custom.className = "provider-strip";
+  custom.dataset.providerGroup = "custom";
+  const heading = document.createElement("h3");
+  heading.textContent = "Custom providers";
+  const add = authButton("Add provider", () => openCustomProviderDialog(), "primary-button");
+  add.id = "addCustomProvider";
+  add.disabled = !!state.config.custom_providers_locked;
+  const empty = document.createElement("p");
+  empty.textContent = "No custom providers yet.";
+  empty.hidden = state.config.custom_providers.length > 0;
+  const grid = document.createElement("div");
+  grid.className = "provider-grid";
+  grid.id = "providers-custom";
+  const header = document.createElement("div");
+  header.className = "strip-header";
+  header.append(heading, add);
+  custom.append(header, empty, grid);
+  container.appendChild(custom);
   providerStatus.forEach(updateProviderCard);
 }
 
@@ -343,7 +376,7 @@ function updateProviderCard(provider) {
   const kind = oauth ? "oauth" : provider.kind === "local" ? "local" : "cloud";
   const configured = oauth ? status?.connected : provider.status === "configured";
   const subgroup = oauth && configured == null ? "loading" : configured ? "configured" : "unconfigured";
-  const grid = byId(`providers-${kind}-${subgroup}`);
+  const grid = byId(provider.kind === "custom" ? "providers-custom" : `providers-${kind}-${subgroup}`);
   let card = document.querySelector(`[data-provider="${provider.provider_id}"]`);
   if (!card) {
     card = document.createElement("article");
@@ -362,12 +395,12 @@ function updateProviderCard(provider) {
   website.rel = "noopener noreferrer";
   const logo = document.createElement("img");
   logo.className = "provider-logo";
-  logo.src = new URL(`providers/${provider.logo_filename}`, adminAssetBase);
+  if (provider.logo_filename) logo.src = new URL(`providers/${provider.logo_filename}`, adminAssetBase);
   logo.alt = "";
   logo.width = 20;
   logo.height = 20;
   website.append(name, logo);
-  title.appendChild(website);
+  title.appendChild(provider.kind === "custom" ? name : website);
   const meta = document.createElement("span");
   meta.className = "provider-meta";
   meta.hidden = !oauth;
@@ -375,10 +408,14 @@ function updateProviderCard(provider) {
   result.className = "provider-check-result";
   result.dataset.providerCheckResult = provider.provider_id;
   result.hidden = true;
+  const availability = document.createElement("span");
+  availability.className = "provider-availability-result";
+  availability.dataset.providerAvailabilityResult = provider.provider_id;
+  availability.hidden = true;
   const actions = document.createElement("div");
   actions.className = "provider-actions";
   if (oauth) populateConnectedAccountActions(provider, status, actions);
-  if (provider.settings_keys?.length) {
+  if (provider.kind === "custom" || provider.settings_keys?.length) {
     const edit = oauth || configured;
     const settings = authButton(edit ? "Edit" : "Configure", () => openProviderDialog(provider.provider_id), edit ? "secondary-button" : "primary-button");
     settings.dataset.providerSettings = "true";
@@ -386,7 +423,7 @@ function updateProviderCard(provider) {
     settings.setAttribute("aria-controls", "providerDialog");
     actions.appendChild(settings);
   }
-  card.replaceChildren(title, meta, result, actions);
+  card.replaceChildren(title, meta, result, availability, actions);
   const next = [...grid.children].find((other) => other !== card &&
     connectedAccountName(provider).localeCompare(providerDisplayName(other.dataset.provider), "en", { sensitivity: "base" }) < 0);
   if (card.parentElement !== grid || card.nextElementSibling !== (next || null)) grid.insertBefore(card, next || null);
@@ -400,7 +437,16 @@ function updateProviderCard(provider) {
   renderProviderCheckResult(provider.provider_id);
 }
 
-function openProviderDialog(providerId) {
+async function refreshProviderConfig() {
+  if (!state.configRefreshRequired) return true;
+  try { await load({ providersOnly: true }); return true; }
+  catch (error) { showMessage(`Could not reload settings: ${error.message}`, "error"); return false; }
+}
+
+async function openProviderDialog(providerId) {
+  if (!await refreshProviderConfig()) return;
+  if (connectedAccountDescriptor(providerId)?.kind === "custom") return openCustomProviderDialog(providerId);
+  state.customProvider = null;
   state.providerId = providerId;
   const provider = connectedAccountDescriptor(providerId);
   byId("providerDialogTitle").textContent = connectedAccountName(provider);
@@ -423,13 +469,80 @@ function openProviderDialog(providerId) {
   });
   renderProviderDialogActions(provider);
   updateDirtyState();
-  byId("providerDialog").showModal();
+  if (!byId("providerDialog").open) byId("providerDialog").showModal();
   const missing = provider.missing_configuration_keys?.[0];
-  const first = missing ? byId(`field-${missing}`) : fields.querySelector("input:not(:disabled), select:not(:disabled), textarea:not(:disabled)");
+  const target = missing ? byId(`field-${missing}`) : null;
+  const first = target?.dataset.fieldType === "api_key_list"
+    ? target.closest(".api-key-editor").querySelector("input:not([type=hidden]):not(:disabled), button:not(:disabled)")
+    : target || fields.querySelector("input:not([type=hidden]):not(:disabled), select:not(:disabled), textarea:not(:disabled), button:not(:disabled)");
   first?.focus();
 }
 
+const CUSTOM_LABELS = {
+  provider_default: "Provider default", openai_effort: "OpenAI effort", limited_effort: "Limited effort (low / medium / high)",
+  reasoning_object: "Reasoning object", thinking: "Thinking on/off", chat_template: "Chat-template thinking",
+  native_responses: "Native reasoning", messages_manual: "Token-budget thinking", messages_adaptive: "Adaptive thinking",
+};
+
+async function openCustomProviderDialog(providerId = null) {
+  if (!await refreshProviderConfig()) return;
+  const provider = state.config.custom_providers.find((item) => item.provider_id === providerId) || {
+    display_name: "", base_url: "", api_keys: { revision: null, entries: [] }, api_format: "openai_chat", reasoning_format: "provider_default", reasoning_history_format: "reasoning_content", model_ids: [],
+  };
+  state.providerId = providerId || "__custom_new__";
+  state.customProvider = provider;
+  byId("providerDialogTitle").textContent = providerId ? provider.display_name : "Add provider";
+  byId("providerMessage").textContent = "";
+  byId("providerDialogCheck").hidden = true;
+  renderProviderCheckMessage(byId("providerDialogAvailability"), null);
+  const fields = byId("providerFields");
+  fields.replaceChildren();
+  const formats = (state.config.custom_reasoning_formats || {})[provider.api_format] || ["provider_default"];
+  const definitions = [
+    ["display_name", "Name", "string", [], ""],
+    ["base_url", "Base URL", "string", [], "Include the API path, for example https://gateway.example/v1."],
+    ["api_keys", "API keys", "api_key_list", [], "Key 1 is used. Leave the list empty for endpoints that do not require a key."],
+    ["api_format", "API format", "select", [["openai_chat", "Chat Completions"], ["openai_responses", "Responses"], ["anthropic_messages", "Anthropic Messages"]], "Select the API exposed by your endpoint."],
+    ["reasoning_format", "Reasoning format", "select", formats.map((value) => [value, CUSTOM_LABELS[value]]), "How FCC sends reasoning controls. Provider default leaves computation to the upstream."],
+    ["reasoning_history_format", "Reasoning history format", "select", [["reasoning_content", "reasoning_content"], ["reasoning", "reasoning"]], "How previous reasoning is sent to a Chat Completions endpoint."],
+    ["model_ids", "Model IDs", "textarea", [], "Optional, one upstream model ID per line. Leave empty to discover models automatically."],
+  ];
+  for (const [key, label, type, options, description] of definitions) {
+    fields.appendChild(renderField({ key, label, type, options: options.map(([value, label]) => ({value, label})), description,
+      value: key === "model_ids" ? provider.model_ids.join("\n") : key === "reasoning_history_format" && provider.api_format !== "openai_chat" ? "reasoning_content" : provider[key], nullable: key === "api_keys", secret: key === "api_keys",
+      configured: key === "api_keys" && !!provider.api_keys?.entries.length, locked: !!state.config.custom_providers_locked, source: state.config.custom_providers_locked ? "process" : "managed_env" }));
+  }
+  const format = byId("field-api_format");
+  const reasoning = byId("field-reasoning_format");
+  const history = byId("field-reasoning_history_format");
+  history.closest(".field").hidden = format.value !== "openai_chat";
+  format.addEventListener("change", () => {
+    const allowed = state.config.custom_reasoning_formats[format.value];
+    const previous = reasoning.value;
+    reasoning.replaceChildren(...allowed.map((value) => option(value, CUSTOM_LABELS[value])));
+    reasoning.value = allowed.includes(previous) ? previous : "provider_default";
+    history.closest(".field").hidden = format.value !== "openai_chat";
+    updateDirtyState();
+  });
+  const actions = byId("providerDialogActions");
+  actions.replaceChildren();
+  if (providerId && !state.config.custom_providers_locked) {
+    if (!provider.model_ids.length) actions.appendChild(authButton("Refresh models", (button) => testProvider(providerId, button), "secondary-button"));
+    actions.appendChild(authButton("Remove provider", () => apply(providerId, "delete"), "danger-button"));
+    const modelConfig = document.createElement("a");
+    modelConfig.href = "/admin/model_config";
+    modelConfig.textContent = "Model Config";
+    modelConfig.addEventListener("click", (event) => { event.preventDefault(); byId("providerDialog").close(); navigateToView("model_config"); });
+    actions.appendChild(modelConfig);
+  }
+  byId("saveProvider").hidden = false;
+  updateDirtyState();
+  if (!byId("providerDialog").open) byId("providerDialog").showModal();
+  byId("field-display_name").focus();
+}
+
 function renderProviderDialogActions(provider) {
+  if (state.customProvider) return;
   if (state.providerId !== provider.provider_id) return;
   const actions = byId("providerDialogActions");
   actions.replaceChildren();
@@ -445,10 +558,8 @@ function renderProviderDialogActions(provider) {
     actions.appendChild(button);
   }
   const check = oauth ? null : providerCheckResult(provider.provider_id);
-  const result = byId("providerDialogCheck");
-  result.className = `provider-check-result ${check?.status || ""}`;
-  result.textContent = check?.message || "";
-  result.hidden = !check?.message;
+  renderProviderCheckMessage(byId("providerDialogCheck"), check);
+  renderProviderCheckMessage(byId("providerDialogAvailability"), check?.availability);
   byId("saveProvider").hidden = !provider.settings_keys?.length;
   renderStartup();
 }
@@ -671,14 +782,22 @@ function providerCheckResult(providerId) {
   // An explicit check takes precedence over background discovery and reachability.
   if (check?.source === "manual") return check;
   const discovery = state.startup?.startup?.providers?.[providerId];
-  if (discovery === "starting") return { status: "checking", message: "Checking models…" };
-  if (discovery === "failed") {
-    return { status: "error", message: "Could not load models. Check the provider's settings and retry." };
+  let result;
+  if (discovery === "starting") {
+    result = { status: "checking", message: "Checking models…" };
+  } else if (discovery === "failed") {
+    result = { status: "error", message: state.startup.startup.provider_errors?.[providerId] || "Could not load models. Check the provider's settings and retry." };
+  } else if (discovery === "ready") {
+    result = { status: "ok", message: modelCountMessage(state.startup.cached_models[providerId]?.length || 0) };
+  } else if (discovery === "unavailable") {
+    return {
+      status: "",
+      message: "Local server unavailable",
+      availability: check ? { ...check, status: "" } : undefined,
+    };
   }
-  if (discovery === "ready") {
-    return { status: "ok", message: modelCountMessage(state.startup.cached_models[providerId]?.length || 0) };
-  }
-  return check;
+  // Model discovery and endpoint reachability are separate observations.
+  return result ? { ...result, availability: check } : check;
 }
 
 function updateProviderCheckResult(providerId, status, message, source = "manual") {
@@ -686,8 +805,17 @@ function updateProviderCheckResult(providerId, status, message, source = "manual
   renderProviderCheckResult(providerId);
 }
 
+function renderProviderCheckMessage(element, check) {
+  for (const status of ["ok", "error", "checking"]) {
+    element.classList.toggle(status, check?.status === status);
+  }
+  element.textContent = check?.message || "";
+  element.hidden = !check?.message;
+}
+
 function renderProviderCheckResult(providerId) {
-  const { status = "", message = "" } = providerCheckResult(providerId) || {};
+  const check = providerCheckResult(providerId);
+  const { status = "" } = check || {};
   const card = document.querySelector(`[data-provider="${providerId}"]`);
   if (!card) return;
   const provider = connectedAccountDescriptor(providerId);
@@ -702,15 +830,11 @@ function renderProviderCheckResult(providerId) {
     if (account?.state === "error") meta.classList.add("error");
     return;
   }
-  const result = card.querySelector(".provider-check-result");
-  result.className = `provider-check-result ${status}`;
-  result.textContent = message;
-  result.hidden = !message;
+  renderProviderCheckMessage(card.querySelector(".provider-check-result"), check);
+  renderProviderCheckMessage(card.querySelector(".provider-availability-result"), check?.availability);
   if (state.providerId === providerId) {
-    const modalResult = byId("providerDialogCheck");
-    modalResult.className = result.className;
-    modalResult.textContent = message;
-    modalResult.hidden = !message;
+    renderProviderCheckMessage(byId("providerDialogCheck"), check);
+    renderProviderCheckMessage(byId("providerDialogAvailability"), check?.availability);
   }
 }
 
@@ -755,9 +879,11 @@ function renderSections(sections, fields) {
 
       const grid = document.createElement("div");
       grid.className = "field-grid";
-      sectionFields.forEach((field) => {
-        grid.appendChild(renderField(field));
-      });
+      if (section.id === "models") {
+        renderModelRoutes(grid, sectionFields);
+      } else {
+        sectionFields.forEach((field) => grid.appendChild(renderField(field)));
+      }
       sectionEl.appendChild(grid);
 
       if (sectionFields.some((field) => field.advanced)) {
@@ -775,6 +901,28 @@ function renderSections(sections, fields) {
       container.appendChild(sectionEl);
     });
   });
+}
+
+function renderModelRoutes(grid, fields) {
+  const fieldsByKey = new Map(fields.map((field) => [field.key, field]));
+  const routes = [
+    ["Default", "MODEL", "REASONING_POLICY"],
+    ["Fable", "MODEL_FABLE", "REASONING_FABLE"],
+    ["Opus", "MODEL_OPUS", "REASONING_OPUS"],
+    ["Sonnet", "MODEL_SONNET", "REASONING_SONNET"],
+    ["Haiku", "MODEL_HAIKU", "REASONING_HAIKU"],
+  ];
+  for (const [name, modelKey, effortKey] of routes) {
+    const row = document.createElement("div");
+    row.className = "model-route-row";
+    row.setAttribute("role", "group");
+    row.setAttribute("aria-label", `${name} model and effort`);
+    row.append(renderField(fieldsByKey.get(modelKey)), renderField(fieldsByKey.get(effortKey)));
+    grid.appendChild(row);
+    fieldsByKey.delete(modelKey);
+    fieldsByKey.delete(effortKey);
+  }
+  fieldsByKey.forEach((field) => grid.appendChild(renderField(field)));
 }
 
 function renderField(field) {
@@ -796,6 +944,20 @@ function renderField(field) {
     label.appendChild(sourceEl);
   }
 
+  if (field.type === "api_key_list") {
+    label.id = `field-${field.key}-label`;
+    label.removeAttribute("for");
+    const editor = new window.FccApiKeyEditor(field, updateDirtyState);
+    wrapper.append(label, editor.element);
+    if (field.description) {
+      const description = document.createElement("div");
+      description.className = "field-description";
+      description.textContent = field.description;
+      wrapper.appendChild(description);
+    }
+    return wrapper;
+  }
+
   const input = window.FccFormControls.configure(inputForField(field));
   input.id = `field-${field.key}`;
   input.dataset.key = field.key;
@@ -811,6 +973,7 @@ function renderField(field) {
   input.addEventListener("input", () => {
     input.dataset.remove = "false";
     clearCredentialError(input);
+    if (state.providerId) credentialEditors().forEach((editor) => editor.clearResults());
   });
   if (field.type === "optional_model") {
     input.addEventListener("blur", () => {
@@ -855,6 +1018,7 @@ function renderField(field) {
 }
 
 function inputForField(field) {
+  if (field.type === "textarea") { const input = document.createElement("textarea"); input.rows = 3; input.value = field.value || ""; return input; }
   if (field.type === "boolean") {
     const input = document.createElement("input");
     input.type = "checkbox";
@@ -914,6 +1078,7 @@ function createModelCombobox(input, field) {
   return new window.FccModelCombobox(input, {
     listboxId: `model-options-${field.key}`,
     label: field.label,
+    displayValue: (value) => state.modelLabels.get(value) || value,
     values: () =>
       field.type === "optional_model"
         ? ["None", ...state.modelOptions]
@@ -930,40 +1095,65 @@ class ModelListEditor {
   constructor(input, field) {
     this.input = input;
     this.field = field;
-    this.values = input.value
-      ? input.value.split(",").map((value) => value.trim()).filter(Boolean)
-      : [];
+    this.values = input.value ? JSON.parse(input.value) : [];
     this.inputId = `field-${field.key}-add`;
+    this.rowComboboxes = [];
+    this.rowKeys = [];
+    this.draggedEntry = null;
 
     this.element = document.createElement("div");
     this.element.className = "model-list-editor";
+    this.element.modelListEditor = this;
 
     const addRow = document.createElement("div");
     addRow.className = "model-list-add";
-    this.addInput = window.FccFormControls.configure(document.createElement("input"));
-    this.addInput.id = this.inputId;
-    this.addInput.type = "text";
-    this.addInput.autocomplete = "off";
-    this.addInput.placeholder = "provider/model";
-    this.addInput.disabled = field.locked;
-    const addCombobox = createModelCombobox(this.addInput, {
-      ...field,
-      key: `${field.key}-add`,
-      label: "fallback model",
-      type: "model",
-    });
+    const addCombobox = this.modelCombobox("", "add", "New fallback model");
+    this.addInput = addCombobox.input;
+    this.addEffort = this.effortSelect("inherit", "Fallback reasoning effort");
+    this.addEffort.id = `field-${field.key}-effort`;
+    this.addKey = this.keySelect("", 1, "Fallback API key");
+    this.addProviderId = "";
+    const updateAddModel = () => {
+      const providerId = this.providerId(this.addInput.value);
+      this.updateKeySelect(this.addKey, this.addInput.value, providerId === this.addProviderId ? Number(this.addKey.value) : 1);
+      this.addProviderId = providerId;
+    };
+    this.addInput.addEventListener("input", updateAddModel);
+    this.addInput.addEventListener("change", updateAddModel);
 
-    this.addButton = document.createElement("button");
-    this.addButton.type = "button";
-    this.addButton.className = "secondary-button";
-    this.addButton.textContent = "Add";
-    this.addButton.disabled = field.locked;
-    this.addButton.addEventListener("click", () => this.add());
-    addRow.append(addCombobox.element, this.addButton);
+    this.addButton = this.actionButton("", "Add fallback", () => this.add());
+    this.addButton.className = "secondary-button model-list-action";
+    this.addButton.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M12 6v12M6 12h12" stroke-linecap="round"/></svg>';
+    addRow.append(addCombobox.element, this.addEffort, this.addKey, this.addButton);
 
     this.rows = document.createElement("div");
     this.rows.className = "model-list-rows";
-    this.element.append(input, addRow, this.rows);
+    this.rows.addEventListener("dragover", (event) => {
+      if (!this.draggedEntry || this.field.locked) return;
+      event.preventDefault();
+      this.clearDropIndicators();
+      const insertion = this.dropInsertion(event);
+      if (this.dropDestination(insertion) === this.values.indexOf(this.draggedEntry)) {
+        event.dataTransfer.dropEffect = "none";
+        return;
+      }
+      event.dataTransfer.dropEffect = "move";
+      const next = this.rows.children[insertion];
+      const marker = next || this.rows.lastElementChild;
+      marker.dataset.dropPosition = next ? "before" : "after";
+    });
+    this.rows.addEventListener("dragleave", (event) => {
+      if (!this.rows.contains(event.relatedTarget)) this.clearDropIndicators();
+    });
+    this.rows.addEventListener("drop", (event) => {
+      if (!this.draggedEntry || this.field.locked) return;
+      event.preventDefault();
+      const moved = this.draggedEntry;
+      const destination = this.dropDestination(this.dropInsertion(event));
+      this.clearDrag();
+      this.move(moved, destination);
+    });
+    this.element.append(input, this.rows, addRow);
     this.renderRows();
   }
 
@@ -973,81 +1163,204 @@ class ModelListEditor {
       showMessage("Enter a full provider/model fallback.", "error");
       return;
     }
-    if (this.values.includes(value)) {
-      showMessage("That fallback model is already in the list.", "error");
+    const apiKeyNumber = Number(this.addKey.value);
+    if (this.values.some((entry) => entry.model === value && (entry.api_key_number ?? 1) === apiKeyNumber)) {
+      showMessage("That model and API key are already in the fallback list.", "error");
       return;
     }
-    this.values.push(value);
+    this.values.push({ model: value, reasoning: this.addEffort.value, api_key_number: apiKeyNumber });
     this.addInput.value = "";
+    this.addEffort.value = "inherit";
+    this.addProviderId = "";
+    this.updateKeySelect(this.addKey, "", 1);
     showMessage("");
     this.sync();
+    this.renderRows();
   }
 
-  move(index, offset) {
-    const destination = index + offset;
-    if (destination < 0 || destination >= this.values.length) return;
-    [this.values[index], this.values[destination]] = [
-      this.values[destination],
-      this.values[index],
-    ];
+  move(entry, destination) {
+    const index = this.values.indexOf(entry);
+    if (this.field.locked || destination < 0 || destination >= this.values.length || index === destination) return;
+    this.values.splice(index, 1);
+    this.values.splice(destination, 0, entry);
     this.sync();
+    this.renderRows();
   }
 
   remove(index) {
     this.values.splice(index, 1);
     this.sync();
-  }
-
-  sync() {
-    this.input.value = this.values.join(",");
-    this.input.dataset.remove = "false";
-    this.input.dispatchEvent(new Event("input", { bubbles: true }));
     this.renderRows();
   }
 
-  renderRows() {
-    this.rows.innerHTML = "";
-    if (this.values.length === 0) {
-      const empty = document.createElement("div");
-      empty.className = "model-list-empty";
-      empty.textContent = "No fallback models configured.";
-      this.rows.appendChild(empty);
-      return;
-    }
+  sync() {
+    this.input.value = this.values.length ? JSON.stringify(this.values) : "";
+    this.input.dataset.remove = "false";
+    this.input.dispatchEvent(new Event("input", { bubbles: true }));
+  }
 
-    this.values.forEach((value, index) => {
+  renderRows() {
+    this.rowComboboxes.forEach((combobox) => {
+      combobox.close();
+      state.modelComboboxes.delete(combobox);
+    });
+    this.rowComboboxes = [];
+    this.rowKeys = [];
+    this.rows.replaceChildren();
+
+    this.values.forEach((entry, index) => {
       const row = document.createElement("div");
       row.className = "model-list-row";
 
-      const model = document.createElement("span");
-      model.className = "model-list-value";
-      model.textContent = value;
+      const combobox = this.modelCombobox(entry.model, `row-${index}`, `Fallback model ${index + 1}`);
+      this.rowComboboxes.push(combobox);
+      const effort = this.effortSelect(entry.reasoning, `Reasoning effort for ${entry.model}`);
+      effort.addEventListener("change", () => {
+        entry.reasoning = effort.value;
+        this.sync();
+      });
+      const key = this.keySelect(entry.model, entry.api_key_number ?? 1, `API key for ${entry.model}`);
+      this.rowKeys.push({ entry, select: key });
+      key.addEventListener("change", () => {
+        entry.api_key_number = Number(key.value);
+        this.sync();
+      });
 
-      const up = this.actionButton("Move up", `Move ${value} up`, () =>
-        this.move(index, -1),
-      );
-      up.disabled = this.field.locked || index === 0;
-      const down = this.actionButton("Move down", `Move ${value} down`, () =>
-        this.move(index, 1),
-      );
-      down.disabled = this.field.locked || index === this.values.length - 1;
-      const remove = this.actionButton("Remove", `Remove ${value}`, () =>
-        this.remove(index),
-      );
-      remove.disabled = this.field.locked;
+      const handle = this.actionButton("⠿", `Move ${entry.model}`);
+      handle.classList.add("model-list-drag");
+      handle.draggable = !this.field.locked;
+      handle.title = "Drag to reorder, or use the up and down arrow keys.";
+      handle.addEventListener("keydown", (event) => {
+        if (event.key !== "ArrowUp" && event.key !== "ArrowDown") return;
+        event.preventDefault();
+        this.move(entry, this.values.indexOf(entry) + (event.key === "ArrowUp" ? -1 : 1));
+        this.rows.children[this.values.indexOf(entry)].querySelector(".model-list-drag").focus();
+      });
+      handle.addEventListener("dragstart", (event) => {
+        this.draggedEntry = entry;
+        event.dataTransfer.effectAllowed = "move";
+        event.dataTransfer.setData("text/plain", entry.model);
+        row.classList.add("dragging");
+      });
+      handle.addEventListener("dragend", () => this.clearDrag());
 
-      row.append(model, up, down, remove);
+      const remove = this.actionButton("", `Remove ${entry.model}`, () => this.remove(index));
+      remove.className = "danger-button model-list-action";
+      remove.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M3 6h18M9 6V4h6v2M5 6l1 14h12l1-14M10 10v6M14 10v6" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+      const updateModel = () => {
+        const previousProvider = this.providerId(entry.model);
+        entry.model = combobox.input.value.trim();
+        if (this.providerId(entry.model) !== previousProvider) entry.api_key_number = 1;
+        this.updateKeySelect(key, entry.model, entry.api_key_number ?? 1);
+        key.setAttribute("aria-label", `API key for ${entry.model}`);
+        effort.setAttribute("aria-label", `Reasoning effort for ${entry.model}`);
+        handle.setAttribute("aria-label", `Move ${entry.model}`);
+        remove.setAttribute("aria-label", `Remove ${entry.model}`);
+        this.sync();
+      };
+      combobox.input.addEventListener("input", updateModel);
+      combobox.input.addEventListener("change", updateModel);
+
+      row.append(handle, combobox.element, effort, key, remove);
       this.rows.appendChild(row);
     });
   }
 
-  actionButton(text, label, action) {
+  modelCombobox(value, suffix, label) {
+    const input = window.FccFormControls.configure(document.createElement("input"));
+    input.id = `field-${this.field.key}-${suffix}`;
+    input.type = "text";
+    input.autocomplete = "off";
+    input.placeholder = "provider/model";
+    input.disabled = this.field.locked;
+    input.value = value;
+    input.setAttribute("aria-label", label);
+    return createModelCombobox(input, { ...this.field, key: `${this.field.key}-${suffix}`, label, type: "model" });
+  }
+
+  dropInsertion(event) {
+    const index = Array.from(this.rows.children).findIndex((row) => {
+      const bounds = row.getBoundingClientRect();
+      return event.clientY < bounds.top + bounds.height / 2;
+    });
+    return index === -1 ? this.values.length : index;
+  }
+
+  dropDestination(insertion) {
+    const source = this.values.indexOf(this.draggedEntry);
+    return insertion - (source < insertion ? 1 : 0);
+  }
+
+  clearDropIndicators() {
+    this.rows.querySelectorAll("[data-drop-position]").forEach((row) => delete row.dataset.dropPosition);
+  }
+
+  clearDrag() {
+    this.draggedEntry = null;
+    this.clearDropIndicators();
+    this.rows.querySelectorAll(".dragging").forEach((row) => row.classList.remove("dragging"));
+  }
+
+  effortSelect(value, label) {
+    const select = window.FccFormControls.configure(document.createElement("select"));
+    this.field.options.forEach((item) => select.appendChild(option(item.value, item.label)));
+    select.value = value;
+    select.disabled = this.field.locked;
+    select.setAttribute("aria-label", label);
+    return select;
+  }
+
+  providerId(model) {
+    return model.includes("/") ? model.trim().split("/", 1)[0] : "";
+  }
+
+  keyCount(model) {
+    const providerId = this.providerId(model);
+    const custom = state.config.custom_providers.find((provider) => provider.provider_id === providerId);
+    if (custom) return custom.api_keys.entries.length;
+    const provider = state.config.provider_status.find((item) => item.provider_id === providerId);
+    const credential = provider?.settings_keys.map((key) => state.fields.get(key)).find((field) => field?.type === "api_key_list");
+    return credential ? credential.value.entries.length : null;
+  }
+
+  keySelect(model, value, label) {
+    const select = window.FccFormControls.configure(document.createElement("select"));
+    select.setAttribute("aria-label", label);
+    this.updateKeySelect(select, model, value);
+    return select;
+  }
+
+  updateKeySelect(select, model, value) {
+    const count = this.keyCount(model);
+    select.replaceChildren();
+    if (count === null) {
+      select.appendChild(option(1, this.providerId(model) ? "Default authentication" : "Key 1"));
+    } else {
+      for (let number = 1; number <= Math.max(1, count); number++) select.appendChild(option(number, `Key ${number}`));
+    }
+    if (value > Math.max(1, count ?? 1)) {
+      const unavailable = option(value, `Key ${value} (unavailable)`);
+      unavailable.disabled = true;
+      select.appendChild(unavailable);
+    }
+    select.value = String(value);
+    select.disabled = this.field.locked || count === null || (count === 0 && value === 1);
+  }
+
+  refreshKeyOptions() {
+    this.updateKeySelect(this.addKey, this.addInput.value, Number(this.addKey.value));
+    this.rowKeys.forEach(({ entry, select }) => this.updateKeySelect(select, entry.model, entry.api_key_number ?? 1));
+  }
+
+  actionButton(text, label, action = null) {
     const button = document.createElement("button");
     button.type = "button";
     button.className = "ghost-button model-list-action";
     button.textContent = text;
     button.setAttribute("aria-label", label);
-    button.addEventListener("click", action);
+    button.title = label;
+    button.disabled = this.field.locked;
+    if (action) button.addEventListener("click", action);
     return button;
   }
 }
@@ -1060,6 +1373,7 @@ function option(value, label) {
 }
 
 function readFieldValue(input) {
+  if (input.dataset.fieldType === "api_key_list") return JSON.parse(input.value);
   if (input.type === "checkbox") return input.checked ? "true" : "false";
   if (input.dataset.remove === "true") return null;
   if (
@@ -1076,6 +1390,7 @@ function readFieldValue(input) {
 }
 
 function comparableValue(value) {
+  if (value !== null && typeof value === "object") return JSON.stringify(value);
   return value === null ? NULL_VALUE : String(value);
 }
 
@@ -1096,7 +1411,7 @@ function updateDirtyState() {
   byId("dirtyState").textContent =
     state.restart ? "Changes saved" : count === 0 ? "No changes" : `${count} unsaved change${count === 1 ? "" : "s"}`;
   byId("applyButton").disabled = state.applying || (!state.restart && count === 0);
-  byId("saveProvider").disabled = state.applying || !!state.restart || !Object.keys(changedValues(byId("providerFields"))).length;
+  byId("saveProvider").disabled = state.applying || !!state.restart || state.configRefreshRequired || !Object.keys(changedValues(byId("providerFields"))).length;
 }
 
 function clearCredentialError(input) {
@@ -1105,9 +1420,21 @@ function clearCredentialError(input) {
   input.removeAttribute("aria-describedby");
 }
 
-function showCredentialErrors(checks) {
+function credentialEditors() {
+  return [...byId("providerFields").querySelectorAll(".api-key-editor")].map((element) => element.apiKeyEditor);
+}
+
+function showCredentialErrors(checks, rowErrors = []) {
   let first = null;
-  checks.forEach((check) => {
+  [...rowErrors.map((error) => ({ ...error, status: "rejected" })), ...checks].forEach((check) => {
+    const editor = credentialEditors().find((editor) => editor.field.key === check.key);
+    if (editor) {
+      if (check.status === "rejected" || check.status === "unverified") {
+        const input = editor.showResult(check.index, check.message, check.status === "rejected");
+        if (check.status === "rejected") first ||= input;
+      }
+      return;
+    }
     const input = byId(`field-${check.key}`);
     if (!input) return;
     clearCredentialError(input);
@@ -1134,6 +1461,7 @@ function setApplying(applying) {
   byId("closeProviderDialog").disabled = applying;
   byId("cancelProviderDialog").disabled = applying;
   byId("saveProvider").textContent = applying ? "Saving…" : "Save";
+  byId("saveProvider").classList.toggle("startup-busy", applying);
   byId("saveProvider").setAttribute("aria-busy", String(applying));
   byId("applyButton").textContent = state.restart
     ? applying ? "Reconnecting…" : "Reconnect"
@@ -1177,7 +1505,7 @@ async function reconnectAfterRestart() {
   state.startupRequest?.controller.abort();
   state.startupRequest = null;
   state.startupAgain = false;
-  const { restart, warnings, providersOnly } = state.restart;
+  const { restart, warnings, providersOnly, providerId, checks } = state.restart;
   const target = new URL(restart.admin_url || "/admin", window.location.href);
   setApplying(true);
   showMessage(["Applied. Reconnecting to the server…", ...warnings].join("\n"), warnings.length ? "warn" : "ok");
@@ -1185,7 +1513,7 @@ async function reconnectAfterRestart() {
     await waitForRestart(restart, target);
     if (target.origin !== window.location.origin) {
       // Carry only the safe warning text across an address change, never edits.
-      target.hash = new URLSearchParams({ "fcc-applied": JSON.stringify(warnings) }).toString();
+      target.hash = new URLSearchParams({ "fcc-applied": JSON.stringify(warnings), ...(providerId ? { "fcc-provider": providerId, "fcc-checks": JSON.stringify(checks) } : {}) }).toString();
       window.location.replace(target.href);
       return;
     }
@@ -1193,7 +1521,9 @@ async function reconnectAfterRestart() {
     state.restart = null;
     void refreshStartup();
     showMessage(["Applied", ...warnings].join("\n"), warnings.length ? "warn" : "ok");
+    if (providerId) await restoreSavedProvider(providerId, checks);
   } catch (error) {
+    state.configRefreshRequired = true;
     showMessage([`Settings were saved. ${error.message} Use Reconnect to try again.`, ...warnings].join("\n"), "warn");
     appendAdminLink(target);
   } finally {
@@ -1201,36 +1531,74 @@ async function reconnectAfterRestart() {
   }
 }
 
-function showRestartNotice() {
+async function showRestartNotice() {
   const url = new URL(window.location.href);
   const fragment = new URLSearchParams(url.hash.slice(1));
   const notice = fragment.get("fcc-applied");
   if (notice === null) return;
   fragment.delete("fcc-applied");
+  const providerId = fragment.get("fcc-provider");
+  const checks = fragment.get("fcc-checks");
+  fragment.delete("fcc-provider");
+  fragment.delete("fcc-checks");
   url.hash = fragment.toString();
   window.history.replaceState(window.history.state, "", url);
   try {
     const warnings = JSON.parse(notice);
     if (Array.isArray(warnings) && warnings.every((warning) => typeof warning === "string")) {
       showMessage(["Applied", ...warnings].join("\n"), warnings.length ? "warn" : "ok");
+      if (providerId && checks) {
+        const parsed = JSON.parse(checks);
+        if (Array.isArray(parsed) && parsed.every((check) => check && typeof check.key === "string" && Number.isInteger(check.index) && typeof check.message === "string" && check.status === "unverified")) await restoreSavedProvider(providerId, parsed);
+      }
     }
   } catch {
     // A malformed navigation notice must not prevent normal Admin use.
   }
 }
 
-async function apply(providerId = null) {
+async function restoreSavedProvider(providerId, checks) {
+  if (!connectedAccountDescriptor(providerId)) return;
+  await openProviderDialog(providerId);
+  showCredentialErrors(checks.map((check) => ({ ...check, message: `Key saved. ${check.message}` })));
+  byId("providerMessage").textContent = "Saved. Some keys could not be verified.";
+  byId("providerMessage").className = "message-area warn";
+}
+
+async function apply(providerId = null, customAction = null) {
   if (state.applying) return;
   if (state.restart) {
     await reconnectAfterRestart();
     return;
   }
+  if (providerId && state.configRefreshRequired) return;
   const values = changedValues(providerId ? byId("providerFields") : byId("adminViews"));
-  if (!Object.keys(values).length) return;
-  const checkingKeys = Object.keys(values).some((key) => {
-    const field = state.fields.get(key);
-    return field?.secret && field.section === "providers" && values[key] !== null;
-  });
+  const custom = providerId && state.customProvider;
+  const action = customAction || (custom?.provider_id ? "update" : "create");
+  if (!Object.keys(values).length && !(custom && action === "delete")) return;
+  if (providerId && action !== "delete") {
+    let invalid = null;
+    for (const editor of credentialEditors()) {
+      const input = editor.validate();
+      invalid ||= input;
+      values[editor.field.key] = editor.payload();
+    }
+    if (invalid) {
+      showMessage("Check the highlighted API key rows.", "error");
+      invalid.focus();
+      return;
+    }
+  }
+  let mutation = null;
+  if (custom) {
+    const selectedFormat = values.api_format || custom.api_format;
+    if (selectedFormat !== "openai_chat") values.reasoning_history_format = "disabled";
+    else if ("api_format" in values) values.reasoning_history_format = byId("field-reasoning_history_format").value;
+    if ("model_ids" in values) values.model_ids = values.model_ids.split(/\r?\n/).map((id) => id.trim()).filter(Boolean);
+    mutation = { action, values: action === "delete" ? {} : values };
+    if (custom.provider_id) mutation.provider_id = custom.provider_id;
+  }
+  const checkingKeys = credentialEditors().some((editor) => values[editor.field.key]?.entries.length);
   let rejectedField = null;
   let applied = false;
   setApplying(true);
@@ -1238,33 +1606,43 @@ async function apply(providerId = null) {
   try {
     const result = await api("/admin/api/config/apply", {
       method: "POST",
-      body: JSON.stringify({ values }),
+      body: JSON.stringify(mutation ? { custom_provider: mutation } : { values }),
     });
     const checks = result.credential_checks || [];
     if (!result.applied) {
-      rejectedField = showCredentialErrors(checks);
-      showMessage(rejectedField ? "Not applied. Check the highlighted API keys." : result.errors.join("; "), "error");
+      rejectedField = showCredentialErrors(checks, result.credential_row_errors || []);
+      showMessage(rejectedField ? "Not applied. Check the highlighted API keys." : (result.errors || []).join("; "), "error");
       return;
     }
     applied = true;
-    if (providerId) byId("providerDialog").close();
-    const warnings = checks.filter((check) => check.status === "unverified").map((check) =>
-      `${state.fields.get(check.key)?.label || check.key}: ${check.message}`
+    const warningChecks = checks.filter((check) => check.status === "unverified");
+    const warnings = warningChecks.map((check) =>
+      `${state.fields.get(check.key)?.label || "API keys"}, Key ${check.index + 1}: Key saved. ${check.message}`
     );
+    const savedProviderId = warnings.length && providerId && mutation?.action !== "delete" ? result.custom_provider_id || providerId : null;
+    if (providerId && !savedProviderId) byId("providerDialog").close();
     const restart = result.restart || {};
     if (restart.required && restart.automatic) {
-      state.restart = { restart, warnings, providersOnly: !!providerId };
+      if (providerId) byId("providerDialog").close();
+      state.restart = { restart, warnings, providersOnly: !!providerId, providerId: savedProviderId, checks: warningChecks };
       await reconnectAfterRestart();
       return;
     }
     const pending = restart.required ? restart.fields || [] : result.pending_fields || [];
     await load({ providersOnly: !!providerId });
+    if (savedProviderId) await restoreSavedProvider(savedProviderId, warningChecks);
     const message = pending.length
       ? `Applied. Restart fcc-server to use: ${pending.join(", ")}`
       : "Applied";
     showMessage([message, ...warnings].join("\n"), warnings.length ? "warn" : "ok");
+    if (savedProviderId) {
+      byId("providerMessage").textContent = `Saved${pending.length ? ". Restart required" : ""}. Some keys could not be verified.`;
+      byId("providerMessage").className = "message-area warn";
+    }
   } catch (error) {
+    if (providerId && (applied || error.status === 409 || !error.status || error.status >= 500)) state.configRefreshRequired = true;
     showMessage(applied ? `Applied, but could not reload settings: ${error.message}` : `Could not apply settings: ${error.message}`, "error");
+    if (providerId && state.configRefreshRequired) byId("providerMessage").append(" Close and reopen this modal to load saved settings before saving again.");
   } finally {
     setApplying(false);
     if (rejectedField) {
@@ -1272,8 +1650,11 @@ async function apply(providerId = null) {
       rejectedField.closest(".settings-section")?.classList.add("show-advanced");
       rejectedField.scrollIntoView({ block: "center", behavior: "instant" });
       rejectedField.focus();
-    } else if (providerId && applied) {
-      document.querySelector(`[data-provider="${providerId}"] [data-provider-settings]`)?.focus({ preventScroll: true });
+    } else if (providerId && applied && !byId("providerDialog").open) {
+      const focus = mutation && mutation.action !== "update"
+        ? byId("addCustomProvider")
+        : document.querySelector(`[data-provider="${providerId}"] [data-provider-settings]`);
+      focus?.focus({ preventScroll: true });
     }
   }
 }
@@ -1286,41 +1667,32 @@ async function refreshLocalStatus(config) {
   };
   state.localStatusRequest = request;
   try {
-    const result = await api("/admin/api/providers/local-status");
-    if (state.localStatusRequest !== request) return;
-    result.providers.forEach((provider) => {
-      if (!request.providerIds.has(provider.provider_id) || provider.status === "missing_url") return;
-      if (provider.status === "reachable") {
-        updateProviderCheckResult(
-          provider.provider_id,
-          "ok",
-          `Reachable: ${provider.base_url}`,
-          "availability",
-        );
-        return;
+    await Promise.all([...request.providerIds].map(async (providerId) => {
+      try {
+        const provider = await api(`/admin/api/providers/${providerId}/local-status`);
+        if (state.localStatusRequest !== request || !request.providerIds.has(providerId)) return;
+        if (provider.status === "missing_url") return;
+        const diagnostics = [];
+        if (provider.probe_path) diagnostics.push(`GET ${provider.probe_path}`);
+        if (typeof provider.latency_ms === "number" && Number.isFinite(provider.latency_ms)) {
+          diagnostics.push(`${provider.latency_ms} ms`);
+        }
+        const suffix = diagnostics.length ? ` (${diagnostics.join(", ")})` : "";
+        if (provider.status === "reachable") {
+          updateProviderCheckResult(providerId, "ok", `Reachable: ${provider.base_url}${suffix}`, "availability");
+          return;
+        }
+        const detail = provider.message
+          ? provider.message
+          : provider.status_code
+            ? `${provider.base_url} returned HTTP ${provider.status_code}`
+            : "The local provider did not respond.";
+        updateProviderCheckResult(providerId, "error", `Unavailable: ${detail}${suffix}`, "availability");
+      } catch {
+        if (state.localStatusRequest !== request || !request.providerIds.has(providerId)) return;
+        updateProviderCheckResult(providerId, "error", "Availability check failed. Use Test to retry.", "availability");
       }
-      const detail = provider.message
-        ? provider.message
-        : provider.status_code
-          ? `${provider.base_url} returned HTTP ${provider.status_code}`
-          : "The local provider did not respond.";
-      updateProviderCheckResult(
-        provider.provider_id,
-        "error",
-        `Unavailable: ${detail}`,
-        "availability",
-      );
-    });
-  } catch {
-    if (state.localStatusRequest !== request) return;
-    request.providerIds.forEach((providerId) => {
-      updateProviderCheckResult(
-        providerId,
-        "error",
-        "Availability check failed. Use Test to retry.",
-        "availability",
-      );
-    });
+    }));
   } finally {
     if (state.localStatusRequest === request) state.localStatusRequest = null;
   }
@@ -1346,7 +1718,7 @@ async function testProvider(providerId, button) {
         "ok",
         modelCountMessage(result.models.length),
       );
-      await hydrateModelOptions();
+      void hydrateModelOptions();
     } else {
       updateProviderCheckResult(
         providerId,
@@ -1385,8 +1757,8 @@ async function loadModelOptions(refresh = false) {
   const result = await api("/admin/api/models" + (refresh ? "/refresh" : ""), {
     method: refresh ? "POST" : "GET",
   });
-  if (request === state.modelOptionsRequest && config === state.config) setModelOptions(result.models);
-  if (refresh && window.CodeSessions) await window.CodeSessions.refresh();
+  if (request === state.modelOptionsRequest && config === state.config) { state.modelLabels = new Map(Object.entries(result.model_labels || {})); setModelOptions(result.models); }
+  if (refresh && window.CodeSessions) void window.CodeSessions.refresh();
   return result;
 }
 
@@ -1459,6 +1831,8 @@ byId("providerDialog").addEventListener("click", (event) => {
 byId("providerDialog").addEventListener("close", () => {
   if (byId("providerDialog").open) return;
   const providerId = state.providerId;
+  const wasCustom = !!state.customProvider;
+  state.customProvider = null;
   state.providerId = null;
   byId("providerFields").replaceChildren();
   updateDirtyState();
@@ -1486,6 +1860,96 @@ try {
 const claudeIntegrationDialog = byId("claudeIntegrationDialog");
 const claudeIntegration = { connected: null, busy: false, paths: null, update: null };
 const claudeIntegrationPath = "/admin/api/integrations/claude-vscode";
+const claudeOnboardingDialog = byId("claudeOnboardingDialog");
+const claudeOnboarding = { completed: null, busy: false, paths: null, refreshAfterSave: false };
+const claudeOnboardingPath = "/admin/api/integrations/claude-onboarding";
+
+function renderClaudeOnboarding() {
+  const { completed, busy, paths, checkRequest } = claudeOnboarding;
+  const button = byId("openClaudeOnboarding");
+  button.textContent = busy ? checkRequest ? "Loading…" : "Saving…" : completed === null ? "Retry" : completed ? "Completed" : "Complete onboarding";
+  button.disabled = busy || completed === true;
+  button.setAttribute("aria-busy", String(busy));
+  const action = byId("confirmClaudeOnboarding");
+  action.textContent = busy ? "Saving…" : "Complete onboarding";
+  action.disabled = busy || completed !== false;
+  const files = byId("claudeOnboardingFiles");
+  files.replaceChildren();
+  if (paths) {
+    const item = document.createElement("li");
+    const code = document.createElement("code");
+    code.textContent = paths.claude_state;
+    item.appendChild(code);
+    files.appendChild(item);
+  }
+}
+
+async function refreshClaudeOnboarding({ replaceCheck = false } = {}) {
+  if (claudeOnboarding.busy && !claudeOnboarding.checkRequest) {
+    claudeOnboarding.refreshAfterSave = true;
+    return;
+  }
+  if (replaceCheck && claudeOnboarding.checkRequest) {
+    claudeOnboarding.checkRequest = null;
+    claudeOnboarding.busy = false;
+  }
+  const request = beginIntegrationCheck(claudeOnboarding);
+  if (!request) return;
+  renderClaudeOnboarding();
+  try {
+    const result = await api(claudeOnboardingPath);
+    if (!currentIntegrationCheck(claudeOnboarding, request)) return;
+    claudeOnboarding.completed = result.completed;
+    claudeOnboarding.paths = result.paths;
+    integrationMessage("claudeOnboardingMessage", "");
+  } catch (error) {
+    if (!currentIntegrationCheck(claudeOnboarding, request)) return;
+    claudeOnboarding.completed = null;
+    integrationMessage("claudeOnboardingMessage", error.message, true);
+  } finally {
+    finishIntegrationCheck(claudeOnboarding, request, renderClaudeOnboarding);
+  }
+}
+
+byId("openClaudeOnboarding").addEventListener("click", () => {
+  if (claudeOnboarding.completed === null) {
+    void refreshClaudeOnboarding();
+    return;
+  }
+  integrationMessage("claudeOnboardingDialogMessage", "");
+  claudeOnboardingDialog.showModal();
+});
+byId("confirmClaudeOnboarding").addEventListener("click", async () => {
+  if (byId("confirmClaudeOnboarding").disabled) return;
+  claudeOnboarding.busy = true;
+  renderClaudeOnboarding();
+  integrationMessage("claudeOnboardingDialogMessage", "");
+  integrationMessage("claudeOnboardingMessage", "");
+  try {
+    const result = await api(`${claudeOnboardingPath}/complete`, { method: "POST" });
+    claudeOnboarding.completed = result.completed;
+    claudeOnboardingDialog.close();
+    integrationMessage("claudeOnboardingMessage", "Claude onboarding completed.");
+  } catch (error) {
+    integrationMessage("claudeOnboardingDialogMessage", error.message, true);
+    integrationMessage("claudeOnboardingMessage", error.message, true);
+  } finally {
+    claudeOnboarding.busy = false;
+    renderClaudeOnboarding();
+    if (claudeOnboarding.refreshAfterSave) {
+      claudeOnboarding.refreshAfterSave = false;
+      void refreshClaudeOnboarding();
+    }
+  }
+});
+byId("closeClaudeOnboarding").addEventListener("click", () => claudeOnboardingDialog.close());
+claudeOnboardingDialog.addEventListener("click", (event) => {
+  if (event.target !== claudeOnboardingDialog) return;
+  const bounds = claudeOnboardingDialog.getBoundingClientRect();
+  if (event.clientX < bounds.left || event.clientX > bounds.right || event.clientY < bounds.top || event.clientY > bounds.bottom) {
+    claudeOnboardingDialog.close();
+  }
+});
 
 function integrationMessage(id, message, error = false) {
   const element = byId(id);
@@ -1499,18 +1963,46 @@ function integrationUpdating(integration, id) {
     state.startup?.startup?.integrations?.[id]?.state === "starting";
 }
 
+function beginIntegrationCheck(integration) {
+  if (integration.busy && (!integration.checkRequest || integration.checkRequest.config === state.config)) return null;
+  const request = { config: state.config };
+  integration.checkRequest = request;
+  integration.busy = true;
+  return request;
+}
+
+function currentIntegrationCheck(integration, request) {
+  return integration.checkRequest === request && request.config === state.config;
+}
+
+function finishIntegrationCheck(integration, request, render) {
+  if (integration.checkRequest !== request) return;
+  integration.checkRequest = null;
+  integration.busy = false;
+  render();
+  if (request.config === state.config && integration.update?.state === "starting") void refreshStartup();
+}
+
 function refreshIntegrationUpdates(previous, current) {
   if (state.activeView !== "integrations") return;
   for (const [id, integration, refresh, messageId, message] of [
+    ["vscode-chat", vscodeChatIntegration, refreshVSCodeChatIntegration, "vscodeChatIntegrationMessage", "Models updated in VS Code."],
     ["claude-vscode", claudeIntegration, refreshClaudeIntegration, "claudeIntegrationMessage", "Settings updated. Reload VS Code."],
     ["jetbrains-acp", jetBrainsIntegration, refreshJetBrainsIntegration, "jetBrainsIntegrationMessage", "Settings updated. Reopen JetBrains and start a new chat."],
     ["codex", codexIntegration, refreshCodexIntegration, "codexIntegrationMessage", "Settings updated. Restart Codex."],
     ["claude-desktop", claudeDesktopIntegration, refreshClaudeDesktopIntegration, "claudeDesktopIntegrationMessage", "Settings updated. Reopen Claude Desktop."],
+    ["dsh-desktop", dshDesktopIntegration, refreshDshDesktopIntegration, "dshDesktopIntegrationMessage", "DSH Desktop configuration updated."],
   ]) {
     const phase = current?.[id]?.state;
+    // Successful actions clear update metadata, not the last observed state.
+    const observedPhase = integration.update?.state ?? previous?.[id]?.state;
+    // Polling can miss a short update. Reconcile state independently of notices.
     if (phase && phase !== "starting" && (
-      previous?.[id]?.state === "starting" || integration.update?.state === "starting"
-    )) void refresh(false, { background: true });
+      previous?.[id]?.state === "starting" || observedPhase !== phase
+    )) {
+      if (integration.busy) state.startupAgain = true;
+      else void refresh(false, { background: true });
+    }
     if (previous?.[id]?.state === "starting" && phase === "ready" && current[id].changed === true) {
       integrationMessage(messageId, message);
     }
@@ -1529,7 +2021,7 @@ function renderClaudeIntegration() {
   byId("openClaudeIntegration").className = connected && !busy ? "danger-button" : "primary-button";
   byId("confirmClaudeIntegration").className = connected ? "danger-button" : "primary-button";
   byId("claudeIntegrationDescription").textContent = connected
-    ? "Remove FCC's VS Code settings. Claude onboarding stays completed."
+    ? "Remove FCC's VS Code settings."
     : "Will set FCC's URL and token, enable model discovery, skip VS Code login, and complete Claude onboarding.";
   const files = byId("claudeIntegrationFiles");
   files.replaceChildren();
@@ -1547,25 +2039,25 @@ function renderClaudeIntegration() {
 
 async function refreshClaudeIntegration(retry = false, { background = false } = {}) {
   if (!background) integrationMessage("claudeIntegrationMessage", "");
-  if (claudeIntegration.busy) return;
-  claudeIntegration.busy = true;
+  const request = beginIntegrationCheck(claudeIntegration);
+  if (!request) return;
   renderClaudeIntegration();
   try {
     if (retry) await api(`${claudeIntegrationPath}/refresh`, { method: "POST" });
     const result = await api(claudeIntegrationPath);
+    if (!currentIntegrationCheck(claudeIntegration, request)) return;
     claudeIntegration.connected = result.connected;
     claudeIntegration.paths = result.paths;
     claudeIntegration.update = result.update;
     if (result.update?.state === "failed") integrationMessage("claudeIntegrationMessage", result.update.message, true);
     else if (byId("claudeIntegrationMessage").classList.contains("error")) integrationMessage("claudeIntegrationMessage", "");
   } catch (error) {
+    if (!currentIntegrationCheck(claudeIntegration, request)) return;
     claudeIntegration.connected = null;
     claudeIntegration.update = null;
     integrationMessage("claudeIntegrationMessage", error.message, true);
   } finally {
-    claudeIntegration.busy = false;
-    renderClaudeIntegration();
-    if (claudeIntegration.update?.state === "starting") void refreshStartup();
+    finishIntegrationCheck(claudeIntegration, request, renderClaudeIntegration);
   }
 }
 
@@ -1598,6 +2090,7 @@ byId("confirmClaudeIntegration").addEventListener("click", async () => {
   } finally {
     claudeIntegration.busy = false;
     renderClaudeIntegration();
+    if (!disconnect) void refreshClaudeOnboarding({ replaceCheck: true });
   }
 });
 byId("closeClaudeIntegration").addEventListener("click", () => claudeIntegrationDialog.close());
@@ -1606,6 +2099,105 @@ claudeIntegrationDialog.addEventListener("click", (event) => {
   const bounds = claudeIntegrationDialog.getBoundingClientRect();
   if (event.clientX < bounds.left || event.clientX > bounds.right || event.clientY < bounds.top || event.clientY > bounds.bottom) {
     claudeIntegrationDialog.close();
+  }
+});
+
+const vscodeChatIntegrationDialog = byId("vscodeChatIntegrationDialog");
+const vscodeChatIntegration = { connected: null, busy: false, paths: null, update: null };
+const vscodeChatIntegrationPath = "/admin/api/integrations/vscode-chat";
+
+function renderVSCodeChatIntegration() {
+  const { connected, paths } = vscodeChatIntegration;
+  const busy = vscodeChatIntegration.busy || integrationUpdating(vscodeChatIntegration, "vscode-chat");
+  byId("retryVSCodeChatIntegration").hidden = connected === null || vscodeChatIntegration.update?.state !== "failed";
+  byId("retryVSCodeChatIntegration").disabled = busy;
+  const action = connected ? "Disconnect" : "Connect";
+  byId("openVSCodeChatIntegration").textContent = busy ? "Loading…" : connected === null ? "Retry" : action;
+  byId("openVSCodeChatIntegration").disabled = busy;
+  byId("openVSCodeChatIntegration").setAttribute("aria-busy", String(busy));
+  byId("confirmVSCodeChatIntegration").textContent = busy ? "Saving…" : action;
+  byId("confirmVSCodeChatIntegration").disabled = busy || connected === null;
+  byId("openVSCodeChatIntegration").className = connected && !busy ? "danger-button" : "primary-button";
+  byId("confirmVSCodeChatIntegration").className = connected ? "danger-button" : "primary-button";
+  byId("vscodeChatIntegrationDescription").textContent = connected
+    ? "Remove FCC's model group from VS Code Chat."
+    : "Add FCC models to VS Code Chat. Your selected models stay unchanged.";
+  const files = byId("vscodeChatIntegrationFiles");
+  files.replaceChildren();
+  if (paths) {
+    const targets = [paths.vscode_models];
+    targets.forEach((path) => {
+      const item = document.createElement("li");
+      const code = document.createElement("code");
+      code.textContent = path;
+      item.appendChild(code);
+      files.appendChild(item);
+    });
+  }
+}
+
+async function refreshVSCodeChatIntegration(retry = false, { background = false } = {}) {
+  if (!background) integrationMessage("vscodeChatIntegrationMessage", "");
+  const request = beginIntegrationCheck(vscodeChatIntegration);
+  if (!request) return;
+  renderVSCodeChatIntegration();
+  try {
+    if (retry) await api(`${vscodeChatIntegrationPath}/refresh`, { method: "POST" });
+    const result = await api(vscodeChatIntegrationPath);
+    if (!currentIntegrationCheck(vscodeChatIntegration, request)) return;
+    vscodeChatIntegration.connected = result.connected;
+    vscodeChatIntegration.paths = result.paths;
+    vscodeChatIntegration.update = result.update;
+    if (result.update?.state === "failed") integrationMessage("vscodeChatIntegrationMessage", result.update.message, true);
+    else if (byId("vscodeChatIntegrationMessage").classList.contains("error")) integrationMessage("vscodeChatIntegrationMessage", "");
+  } catch (error) {
+    if (!currentIntegrationCheck(vscodeChatIntegration, request)) return;
+    vscodeChatIntegration.connected = null;
+    vscodeChatIntegration.update = null;
+    integrationMessage("vscodeChatIntegrationMessage", error.message, true);
+  } finally {
+    finishIntegrationCheck(vscodeChatIntegration, request, renderVSCodeChatIntegration);
+  }
+}
+
+byId("openVSCodeChatIntegration").addEventListener("click", () => {
+  if (vscodeChatIntegration.connected === null) {
+    refreshVSCodeChatIntegration(true);
+    return;
+  }
+  integrationMessage("vscodeChatIntegrationDialogMessage", "");
+  vscodeChatIntegrationDialog.showModal();
+});
+byId("retryVSCodeChatIntegration").addEventListener("click", () => refreshVSCodeChatIntegration(true));
+byId("confirmVSCodeChatIntegration").addEventListener("click", async () => {
+  if (byId("confirmVSCodeChatIntegration").disabled) return;
+  const disconnect = vscodeChatIntegration.connected;
+  vscodeChatIntegration.busy = true;
+  renderVSCodeChatIntegration();
+  integrationMessage("vscodeChatIntegrationDialogMessage", "");
+  integrationMessage("vscodeChatIntegrationMessage", "");
+  try {
+    const result = await api(`${vscodeChatIntegrationPath}/${disconnect ? "disconnect" : "connect"}`, { method: "POST" });
+    vscodeChatIntegration.connected = result.connected;
+    vscodeChatIntegration.update = null;
+    vscodeChatIntegrationDialog.close();
+    integrationMessage("vscodeChatIntegrationMessage", disconnect
+      ? "Settings removed. Reload VS Code to disconnect."
+      : "Models saved. Select an FCC model in VS Code Chat. Reload VS Code if needed.");
+  } catch (error) {
+    integrationMessage("vscodeChatIntegrationDialogMessage", error.message, true);
+    integrationMessage("vscodeChatIntegrationMessage", error.message, true);
+  } finally {
+    vscodeChatIntegration.busy = false;
+    renderVSCodeChatIntegration();
+  }
+});
+byId("closeVSCodeChatIntegration").addEventListener("click", () => vscodeChatIntegrationDialog.close());
+vscodeChatIntegrationDialog.addEventListener("click", (event) => {
+  if (event.target !== vscodeChatIntegrationDialog) return;
+  const bounds = vscodeChatIntegrationDialog.getBoundingClientRect();
+  if (event.clientX < bounds.left || event.clientX > bounds.right || event.clientY < bounds.top || event.clientY > bounds.bottom) {
+    vscodeChatIntegrationDialog.close();
   }
 });
 
@@ -1648,25 +2240,25 @@ function renderCodexIntegration() {
 
 async function refreshCodexIntegration(retry = false, { background = false } = {}) {
   if (!background) integrationMessage("codexIntegrationMessage", "");
-  if (codexIntegration.busy) return;
-  codexIntegration.busy = true;
+  const request = beginIntegrationCheck(codexIntegration);
+  if (!request) return;
   renderCodexIntegration();
   try {
     if (retry) await api(`${codexIntegrationPath}/refresh`, { method: "POST" });
     const result = await api(codexIntegrationPath);
+    if (!currentIntegrationCheck(codexIntegration, request)) return;
     codexIntegration.connected = result.connected;
     codexIntegration.paths = result.paths;
     codexIntegration.update = result.update;
     if (result.update?.state === "failed") integrationMessage("codexIntegrationMessage", result.update.message, true);
     else if (byId("codexIntegrationMessage").classList.contains("error")) integrationMessage("codexIntegrationMessage", "");
   } catch (error) {
+    if (!currentIntegrationCheck(codexIntegration, request)) return;
     codexIntegration.connected = null;
     codexIntegration.update = null;
     integrationMessage("codexIntegrationMessage", error.message, true);
   } finally {
-    codexIntegration.busy = false;
-    renderCodexIntegration();
-    if (codexIntegration.update?.state === "starting") void refreshStartup();
+    finishIntegrationCheck(codexIntegration, request, renderCodexIntegration);
   }
 }
 
@@ -1745,25 +2337,25 @@ function renderJetBrainsIntegration() {
 
 async function refreshJetBrainsIntegration(retry = false, { background = false } = {}) {
   if (!background) integrationMessage("jetBrainsIntegrationMessage", "");
-  if (jetBrainsIntegration.busy) return;
-  jetBrainsIntegration.busy = true;
+  const request = beginIntegrationCheck(jetBrainsIntegration);
+  if (!request) return;
   renderJetBrainsIntegration();
   try {
     if (retry) await api(`${jetBrainsIntegrationPath}/refresh`, { method: "POST" });
     const result = await api(jetBrainsIntegrationPath);
+    if (!currentIntegrationCheck(jetBrainsIntegration, request)) return;
     jetBrainsIntegration.connected = result.connected;
     jetBrainsIntegration.paths = result.paths;
     jetBrainsIntegration.update = result.update;
     if (result.update?.state === "failed") integrationMessage("jetBrainsIntegrationMessage", result.update.message, true);
     else if (byId("jetBrainsIntegrationMessage").classList.contains("error")) integrationMessage("jetBrainsIntegrationMessage", "");
   } catch (error) {
+    if (!currentIntegrationCheck(jetBrainsIntegration, request)) return;
     jetBrainsIntegration.connected = null;
     jetBrainsIntegration.update = null;
     integrationMessage("jetBrainsIntegrationMessage", error.message, true);
   } finally {
-    jetBrainsIntegration.busy = false;
-    renderJetBrainsIntegration();
-    if (jetBrainsIntegration.update?.state === "starting") void refreshStartup();
+    finishIntegrationCheck(jetBrainsIntegration, request, renderJetBrainsIntegration);
   }
 }
 
@@ -1844,12 +2436,13 @@ function renderClaudeDesktopIntegration() {
 
 async function refreshClaudeDesktopIntegration(retry = false, { background = false } = {}) {
   if (!background) integrationMessage("claudeDesktopIntegrationMessage", "");
-  if (claudeDesktopIntegration.busy) return;
-  claudeDesktopIntegration.busy = true;
+  const request = beginIntegrationCheck(claudeDesktopIntegration);
+  if (!request) return;
   renderClaudeDesktopIntegration();
   try {
     if (retry) await api(`${claudeDesktopIntegrationPath}/refresh`, { method: "POST" });
     const result = await api(claudeDesktopIntegrationPath);
+    if (!currentIntegrationCheck(claudeDesktopIntegration, request)) return;
     claudeDesktopIntegration.connected = result.connected;
     claudeDesktopIntegration.disconnectPending = result.disconnect_pending;
     claudeDesktopIntegration.paths = result.paths;
@@ -1857,14 +2450,13 @@ async function refreshClaudeDesktopIntegration(retry = false, { background = fal
     if (result.update?.state === "failed") integrationMessage("claudeDesktopIntegrationMessage", result.update.message, true);
     else if (byId("claudeDesktopIntegrationMessage").classList.contains("error")) integrationMessage("claudeDesktopIntegrationMessage", "");
   } catch (error) {
+    if (!currentIntegrationCheck(claudeDesktopIntegration, request)) return;
     claudeDesktopIntegration.connected = null;
     claudeDesktopIntegration.disconnectPending = false;
     claudeDesktopIntegration.update = null;
     integrationMessage("claudeDesktopIntegrationMessage", error.message, true);
   } finally {
-    claudeDesktopIntegration.busy = false;
-    renderClaudeDesktopIntegration();
-    if (claudeDesktopIntegration.update?.state === "starting") void refreshStartup();
+    finishIntegrationCheck(claudeDesktopIntegration, request, renderClaudeDesktopIntegration);
   }
 }
 
@@ -1918,6 +2510,123 @@ claudeDesktopIntegrationDialog.addEventListener("click", (event) => {
   const bounds = claudeDesktopIntegrationDialog.getBoundingClientRect();
   if (event.clientX < bounds.left || event.clientX > bounds.right || event.clientY < bounds.top || event.clientY > bounds.bottom) {
     claudeDesktopIntegrationDialog.close();
+  }
+});
+
+const dshDesktopIntegrationDialog = byId("dshDesktopIntegrationDialog");
+const dshDesktopIntegration = { connected: null, actionRevision: 0, busy: false, paths: null, update: null };
+const dshDesktopIntegrationPath = "/admin/api/integrations/dsh-desktop";
+
+function applyDshDesktopStatus(result) {
+  dshDesktopIntegration.connected = result.connected;
+  dshDesktopIntegration.paths = result.paths ?? dshDesktopIntegration.paths;
+  dshDesktopIntegration.update = result.update ?? null;
+}
+
+function renderDshDesktopIntegration() {
+  const { connected, paths } = dshDesktopIntegration;
+  const updating = integrationUpdating(dshDesktopIntegration, "dsh-desktop");
+  const busy = dshDesktopIntegration.busy || (updating && !connected);
+  byId("retryDshDesktopIntegration").hidden = dshDesktopIntegration.update?.state !== "failed";
+  byId("retryDshDesktopIntegration").disabled = busy || updating;
+  const action = connected === null ? "Retry" : connected ? "Disconnect" : "Connect";
+  byId("openDshDesktopIntegration").textContent = busy ? "Loading…" : action;
+  byId("openDshDesktopIntegration").disabled = busy;
+  byId("openDshDesktopIntegration").setAttribute("aria-busy", String(busy));
+  byId("confirmDshDesktopIntegration").textContent = busy ? "Saving…" : action;
+  byId("confirmDshDesktopIntegration").disabled = busy || connected === null;
+  byId("openDshDesktopIntegration").className = connected && !busy ? "danger-button" : "primary-button";
+  byId("confirmDshDesktopIntegration").className = connected ? "danger-button" : "primary-button";
+  byId("dshDesktopIntegrationDescription").textContent = connected
+    ? "Remove FCC's Desktop connection. Existing FCC sessions need another model selected to continue."
+    : "Install and open DSH Desktop once, then connect FCC as the default for new sessions.";
+  const files = byId("dshDesktopIntegrationFiles");
+  files.replaceChildren();
+  if (paths) {
+    const targets = Object.values(paths);
+    targets.forEach((path) => {
+      const item = document.createElement("li");
+      const code = document.createElement("code");
+      code.textContent = path;
+      item.appendChild(code);
+      files.appendChild(item);
+    });
+  }
+}
+
+async function refreshDshDesktopIntegration(retry = false, { background = false } = {}) {
+  if (!background) integrationMessage("dshDesktopIntegrationMessage", "");
+  const request = beginIntegrationCheck(dshDesktopIntegration);
+  if (!request) return;
+  renderDshDesktopIntegration();
+  try {
+    if (retry) await api(`${dshDesktopIntegrationPath}/refresh`, { method: "POST" });
+    const result = await api(dshDesktopIntegrationPath);
+    if (!currentIntegrationCheck(dshDesktopIntegration, request)) return;
+    applyDshDesktopStatus(result);
+    if (result.update?.state === "failed") integrationMessage("dshDesktopIntegrationMessage", result.update.message, true);
+    else if (byId("dshDesktopIntegrationMessage").classList.contains("error")) integrationMessage("dshDesktopIntegrationMessage", "");
+  } catch (error) {
+    if (!currentIntegrationCheck(dshDesktopIntegration, request)) return;
+    integrationMessage("dshDesktopIntegrationMessage", error.message, true);
+  } finally {
+    finishIntegrationCheck(dshDesktopIntegration, request, renderDshDesktopIntegration);
+  }
+}
+
+byId("openDshDesktopIntegration").addEventListener("click", () => {
+  if (dshDesktopIntegration.connected === null) {
+    refreshDshDesktopIntegration(dshDesktopIntegration.update?.state === "failed");
+    return;
+  }
+  integrationMessage("dshDesktopIntegrationDialogMessage", "");
+  dshDesktopIntegrationDialog.showModal();
+});
+byId("confirmDshDesktopIntegration").addEventListener("click", async () => {
+  if (byId("confirmDshDesktopIntegration").disabled) return;
+  const disconnect = dshDesktopIntegration.connected === true;
+  const config = state.config;
+  const actionRevision = ++dshDesktopIntegration.actionRevision;
+  const current = () => config === state.config && actionRevision === dshDesktopIntegration.actionRevision;
+  dshDesktopIntegration.checkRequest = null;
+  dshDesktopIntegration.busy = true;
+  renderDshDesktopIntegration();
+  integrationMessage("dshDesktopIntegrationDialogMessage", "");
+  integrationMessage("dshDesktopIntegrationMessage", "");
+  try {
+    const result = await api(`${dshDesktopIntegrationPath}/${disconnect ? "disconnect" : "connect"}`, { method: "POST" });
+    if (!current()) return;
+    applyDshDesktopStatus(result);
+    dshDesktopIntegrationDialog.close();
+    integrationMessage("dshDesktopIntegrationMessage", result.connected
+      ? "Connected. New DSH sessions use FCC. Reopen DSH if it does not reload the changes."
+      : "DSH Desktop is disconnected. Select another model in existing DSH sessions.");
+  } catch (error) {
+    if (!current()) return;
+    try {
+      const result = await api(dshDesktopIntegrationPath);
+      if (!current()) return;
+      applyDshDesktopStatus(result);
+    } catch {
+      // Keep the last known status if the follow-up read also fails.
+    }
+    if (!current()) return;
+    integrationMessage("dshDesktopIntegrationDialogMessage", error.message, true);
+    integrationMessage("dshDesktopIntegrationMessage", error.message, true);
+  } finally {
+    if (actionRevision !== dshDesktopIntegration.actionRevision) return;
+    dshDesktopIntegration.busy = false;
+    renderDshDesktopIntegration();
+    if (config !== state.config) void refreshDshDesktopIntegration();
+  }
+});
+byId("retryDshDesktopIntegration").addEventListener("click", () => refreshDshDesktopIntegration(true));
+byId("closeDshDesktopIntegration").addEventListener("click", () => dshDesktopIntegrationDialog.close());
+dshDesktopIntegrationDialog.addEventListener("click", (event) => {
+  if (event.target !== dshDesktopIntegrationDialog) return;
+  const bounds = dshDesktopIntegrationDialog.getBoundingClientRect();
+  if (event.clientX < bounds.left || event.clientX > bounds.right || event.clientY < bounds.top || event.clientY > bounds.bottom) {
+    dshDesktopIntegrationDialog.close();
   }
 });
 

@@ -2,7 +2,10 @@
 
 from dataclasses import dataclass
 
-from free_claude_code.application.model_catalog import CatalogModel
+from free_claude_code.application.model_catalog import (
+    CatalogModel,
+    context_window_for_client,
+)
 from free_claude_code.config.server_urls import proxy_v1_url
 from free_claude_code.core.json_types import JsonObject
 from free_claude_code.core.model_capabilities import ModelInputModality
@@ -36,6 +39,9 @@ def build_opencode_config(
         "settings": {
             "baseURL": proxy_v1_url(proxy_root_url),
             "apiKey": f"{{env:{OPENCODE_API_KEY_ENV}}}",
+            "headerTimeout": False,
+            "chunkTimeout": False,
+            "timeout": False,
         },
     }
     default_model = f"{OPENCODE_PROVIDER_ID}/{default_model_id}"
@@ -94,8 +100,7 @@ def _model_config(model: CatalogModel) -> JsonObject:
             "output": ["text"],
         }
     limits: JsonObject = {}
-    if model.context_window_tokens is not None:
-        limits["context"] = model.context_window_tokens
+    limits["context"] = context_window_for_client(model)
     if model.max_output_tokens is not None:
         limits["output"] = model.max_output_tokens
     elif model.context_window_tokens is not None:

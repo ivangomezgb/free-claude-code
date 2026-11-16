@@ -8,6 +8,7 @@ import pytest
 
 from free_claude_code.application.errors import InvalidRequestError
 from free_claude_code.application.model_metadata import ProviderModelInfo
+from free_claude_code.application.response_collection import collect_response
 from free_claude_code.config.provider_catalog import KILO_DEFAULT_BASE
 from free_claude_code.core.anthropic.models import Message, MessagesRequest
 from free_claude_code.core.anthropic.stream_contracts import (
@@ -15,7 +16,6 @@ from free_claude_code.core.anthropic.stream_contracts import (
     text_content,
     thinking_content,
 )
-from free_claude_code.core.history_replay import decode_replay
 from free_claude_code.core.model_capabilities import ModelInputModality
 from free_claude_code.core.reasoning import ReasoningPolicy
 from free_claude_code.providers.kilo import KiloProvider
@@ -26,6 +26,7 @@ from tests.providers.support import (
     immediate_admission,
     make_provider_config,
     reasoning_for,
+    sdk_chat_chunk,
 )
 
 
@@ -34,8 +35,6 @@ def kilo_config():
     return make_provider_config(
         api_key="test_kilo_key",
         base_url=KILO_DEFAULT_BASE,
-        rate_limit=10,
-        rate_window=60,
     )
 
 
@@ -76,7 +75,7 @@ def _chunk(
     if reasoning_details is not None:
         delta.reasoning_details = reasoning_details
     choice = SimpleNamespace(delta=delta, finish_reason=finish_reason)
-    return SimpleNamespace(choices=[choice], usage=None)
+    return sdk_chat_chunk(SimpleNamespace(choices=[choice], usage=None))
 
 
 def test_default_base_url():
@@ -274,22 +273,42 @@ async def test_stream_uses_reasoning_field_without_duplicating_plain_details(
         return_value=stream,
     ):
         event_text = "".join(
-            [event async for event in kilo_provider.stream_messages(request)]
+            [
+                frame
+                async for event in kilo_provider.stream_messages(request)
+                for frame in event.frames
+            ]
         )
 
     events = parse_sse_text(event_text)
     assert thinking_content(events) == "plan "
     assert text_content(events) == "done"
-    records = [
-        decode_replay(event.data["delta"]["signature"]).native
-        for event in events
-        if event.data.get("delta", {}).get("type") == "signature_delta"
-    ]
-    assert len(records) == 1
-    assert records[0]["reasoning_details"] == [
-        {"type": "reasoning.text", "text": "plan "},
-        encrypted,
-    ]
+    from free_claude_code.core.history_replay import decode_replay, is_replay
+
+    records = []
+    for event in events:
+        block = event.data.get("content_block", {})
+        delta = event.data.get("delta", {})
+        value = (
+            block.get("data")
+            if block.get("type") == "redacted_thinking"
+            else delta.get("signature")
+            if delta.get("type") == "signature_delta"
+            else None
+        )
+        if is_replay(value):
+            assert isinstance(value, str)
+            details = decode_replay(value).native["reasoning_details"]
+            assert isinstance(details, list)
+            records.extend(
+                detail["data"]
+                for detail in details
+                if isinstance(detail, dict)
+                and detail.get("type") == "reasoning.encrypted"
+            )
+        elif value is not None:
+            records.append(value)
+    assert records == [encrypted["data"]]
     assert stream.closed
 
 
@@ -317,7 +336,9 @@ async def test_stream_restarts_reasoning_reconciliation_after_early_retry(
         side_effect=[abandoned, recovered],
     ) as create:
         event_text = "".join(
-            [event async for event in kilo_provider.stream_messages(request)]
+            await collect_response(
+                kilo_provider.stream_messages(request), protocol="messages"
+            )
         )
 
     events = parse_sse_text(event_text)
@@ -329,7 +350,7 @@ async def test_stream_restarts_reasoning_reconciliation_after_early_retry(
 
 
 @pytest.mark.asyncio
-async def test_stream_omits_all_reasoning_representations_when_disabled(
+async def test_stream_hides_readable_reasoning_and_preserves_opaque_when_disabled(
     kilo_provider,
 ):
     stream = AsyncStream(
@@ -358,22 +379,24 @@ async def test_stream_omits_all_reasoning_representations_when_disabled(
     ):
         event_text = "".join(
             [
-                event
+                frame
                 async for event in kilo_provider.stream_messages(
                     request,
                     reasoning=ReasoningPolicy.off(),
                 )
+                for frame in event.frames
             ]
         )
 
     events = parse_sse_text(event_text)
     assert thinking_content(events) == ""
     assert text_content(events) == "done"
-    assert all(
-        event.data.get("content_block", {}).get("type") != "redacted_thinking"
+    assert [
+        event.data["content_block"]["data"]
         for event in events
         if event.event == "content_block_start"
-    )
+        and event.data["content_block"]["type"] == "redacted_thinking"
+    ] == ["opaque"]
     assert stream.closed
 
 

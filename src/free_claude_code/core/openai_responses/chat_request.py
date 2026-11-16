@@ -10,9 +10,9 @@ from free_claude_code.core.history_replay import (
     has_readable_replay,
     is_replay,
     readable_reasoning,
-    reasoning_context,
     reasoning_detail,
     tool_history_context,
+    unprotected_replay,
 )
 from free_claude_code.core.json_types import JsonObject, JsonValue
 from free_claude_code.core.openai_chat import (
@@ -23,7 +23,6 @@ from free_claude_code.core.openai_chat import (
     image_tool_result_label,
 )
 from free_claude_code.core.openai_tool_names import OpenAIToolNameCodec
-from free_claude_code.core.trace import trace_event
 
 from .errors import ResponsesConversionError
 from .models import OpenAIResponsesRequest
@@ -35,7 +34,6 @@ from .tool_adaptation import ResponsesToolAdapter, ResponsesToolPolicy
 from .tools import (
     call_id_from_item,
     optional_str,
-    parse_arguments,
     required_str,
 )
 
@@ -58,40 +56,24 @@ class ResponsesChatRequest:
 
     body: dict[str, object]
     tool_names: OpenAIToolNameCodec
-    tool_schemas: dict[str, JsonObject]
     reserved_tool_ids: frozenset[str]
     tool_adapter: ResponsesToolAdapter
 
 
 @dataclass(slots=True)
 class _PendingReasoning:
-    text: str | None = None
-    encrypted: list[str] = field(default_factory=list)
-    contexts: list[str] = field(default_factory=list)
+    items: list[Mapping[str, JsonValue]] = field(default_factory=list)
 
     def add(self, item: Mapping[str, JsonValue]) -> None:
-        if encrypted := encrypted_reasoning_from_item(item):
-            self.encrypted.append(encrypted)
-            if has_readable_replay(encrypted):
-                return
-        for text, summary in readable_reasoning(item):
-            if summary:
-                self.contexts.append(reasoning_context(text, summary=True))
-            else:
-                self.text = combine_reasoning(self.text, text)
+        self.items.append(item)
 
     @property
     def empty(self) -> bool:
-        return self.text is None and not self.encrypted and not self.contexts
+        return not self.items
 
-    def take(self) -> tuple[str | None, list[str], list[str]]:
-        text = self.text
-        encrypted = list(self.encrypted)
-        self.text = None
-        self.encrypted.clear()
-        contexts = list(self.contexts)
-        self.contexts.clear()
-        return text, encrypted, contexts
+    def take(self) -> list[Mapping[str, JsonValue]]:
+        items, self.items = self.items, []
+        return items
 
 
 class _ResponsesChatInputBuilder:
@@ -107,7 +89,6 @@ class _ResponsesChatInputBuilder:
         self._structured_reasoning_details = structured_reasoning_details
         self._pending_reasoning = _PendingReasoning()
         self._pending_rich_output_parts: list[dict[str, object]] = []
-        self._quarantined_call_ids: set[str] = set()
         self._discovery_outputs: list[dict[str, object]] = []
 
     def add(self, item: JsonValue, *, source_type: str | None = None) -> None:
@@ -208,19 +189,6 @@ class _ResponsesChatInputBuilder:
         call_id = call_id_from_item(item)
         name = required_str(item.get("name"), "function_call.name")
         raw_arguments = item.get("arguments")
-        try:
-            parse_arguments(raw_arguments)
-        except ResponsesConversionError as exc:
-            self._quarantined_call_ids.add(call_id)
-            self._pending_reasoning.take()
-            trace_event(
-                stage="responses",
-                event="responses.input.function_call_quarantined",
-                source="openai_responses",
-                call_id=call_id,
-                error_type=type(exc).__name__,
-            )
-            return
         arguments = _arguments_text(raw_arguments)
 
         message: dict[str, object] | None = self._last_tool_call_message()
@@ -241,16 +209,12 @@ class _ResponsesChatInputBuilder:
                 "function": {"name": name, "arguments": arguments},
             }
         )
-        if self._reasoning_replay is ReasoningReplayMode.REASONING_CONTENT:
-            message.setdefault("reasoning_content", "")
 
     def _add_tool_output(
         self, item: Mapping[str, JsonValue], *, source_type: str | None
     ) -> None:
         function = source_type != "custom_tool_call_output"
         call_id = call_id_from_item(item)
-        if function and call_id in self._quarantined_call_ids:
-            return
         if not self._pending_reasoning.empty:
             previous = self._last_tool_call_message()
             if previous is not None:
@@ -308,6 +272,9 @@ class _ResponsesChatInputBuilder:
     def _flush_reasoning(self) -> None:
         if self._pending_reasoning.empty:
             return
+        if self.messages and self.messages[-1].get("role") == "assistant":
+            self._apply_pending_reasoning(self.messages[-1])
+            return
         message: dict[str, object] = {"role": "assistant", "content": ""}
         self._apply_pending_reasoning(message)
         if len(message) > 2 or message.get("content"):
@@ -330,21 +297,68 @@ class _ResponsesChatInputBuilder:
         self._pending_rich_output_parts.clear()
 
     def _apply_pending_reasoning(self, message: dict[str, object]) -> None:
-        text, encrypted, contexts = self._pending_reasoning.take()
+        contexts: list[str] = []
+        details: list[JsonValue] = []
+        for item in self._pending_reasoning.take():
+            encrypted = encrypted_reasoning_from_item(item)
+            unsigned = unprotected_replay(encrypted)
+            if unsigned is not None or not encrypted:
+                for text, _ in readable_reasoning(
+                    unsigned.native if unsigned else item
+                ):
+                    _apply_reasoning_text(message, text, self._reasoning_replay)
+                continue
+            if encrypted and has_readable_replay(encrypted):
+                details.extend(reasoning_detail(encrypted))
+                continue
+            readable = readable_reasoning(item)
+            full_text = [text for text, summary in readable if not summary]
+            content = item.get("content")
+            signed = (
+                self._structured_reasoning_details
+                and encrypted
+                and not is_replay(encrypted)
+                and (
+                    full_text
+                    or (
+                        isinstance(content, list)
+                        and any(
+                            isinstance(part, dict)
+                            and part.get("type") == "reasoning_text"
+                            and part.get("text") == ""
+                            for part in content
+                        )
+                    )
+                )
+            )
+            if signed:
+                details.append(
+                    {
+                        "type": "reasoning.text",
+                        "text": "".join(full_text),
+                        "signature": encrypted,
+                    }
+                )
+            else:
+                for text in full_text:
+                    _apply_reasoning_text(message, text, self._reasoning_replay)
+            for text, summary in readable:
+                if not summary:
+                    continue
+                if self._structured_reasoning_details:
+                    details.append({"type": "reasoning.summary", "summary": text})
+                elif encrypted:
+                    contexts.append(text)
+            if encrypted and not signed:
+                details.extend(reasoning_detail(encrypted))
         if contexts:
             message["content"] = "\n\n".join(
                 [*contexts, str(message.get("content") or "")]
             ).rstrip()
-        if text is not None:
-            _apply_reasoning_text(message, text, self._reasoning_replay)
-        if encrypted:
-            details = message.setdefault("reasoning_details", [])
-            if isinstance(details, list):
-                for value in encrypted:
-                    if self._structured_reasoning_details or is_replay(value):
-                        details.extend(reasoning_detail(value))
-            if not details:
-                message.pop("reasoning_details", None)
+        if details:
+            existing = message.setdefault("reasoning_details", [])
+            if isinstance(existing, list):
+                existing.extend(details)
 
 
 def build_responses_chat_request(
@@ -423,14 +437,12 @@ def build_responses_chat_request(
     if response_format := _chat_response_format(extra.get("text")):
         body["response_format"] = response_format
 
-    tool_schemas = _body_tool_schemas(body)
     reserved_tool_ids = frozenset(_body_tool_call_ids(body))
     tool_names = OpenAIToolNameCodec.from_names(_body_tool_names(body))
     builder.encode_discovery_outputs(tool_names)
     return ResponsesChatRequest(
         body=body,
         tool_names=tool_names,
-        tool_schemas=tool_schemas,
         reserved_tool_ids=reserved_tool_ids,
         tool_adapter=adapter,
     )
@@ -563,24 +575,13 @@ def _rich_function_output_parts(
 def _apply_reasoning_text(
     message: dict[str, object], text: str, mode: ReasoningReplayMode
 ) -> None:
-    if mode in {ReasoningReplayMode.REASONING_CONTENT, ReasoningReplayMode.REASONING}:
-        previous = message.get(mode.value)
-        message[mode.value] = combine_reasoning(
-            previous if isinstance(previous, str) else None, text
-        )
-        return
-    replay = (
-        f"<think>\n{text}\n</think>"
-        if mode is ReasoningReplayMode.THINK_TAGS
-        else reasoning_context(text)
+    field = (
+        "reasoning" if mode is ReasoningReplayMode.REASONING else "reasoning_content"
     )
-    if not replay:
-        return
-    content = message.get("content")
-    if isinstance(content, str) and content:
-        message["content"] = f"{replay}\n\n{content}"
-    else:
-        message["content"] = replay
+    previous = message.get(field)
+    message[field] = combine_reasoning(
+        previous if isinstance(previous, str) else None, text
+    )
 
 
 def _chat_tools(
@@ -708,24 +709,6 @@ def _body_tool_names(body: Mapping[str, object]) -> list[str]:
         if isinstance(function, Mapping) and isinstance(function.get("name"), str):
             names.append(function["name"])
     return names
-
-
-def _body_tool_schemas(body: Mapping[str, object]) -> dict[str, JsonObject]:
-    schemas: dict[str, JsonObject] = {}
-    tools = body.get("tools")
-    if not isinstance(tools, list):
-        return schemas
-    for tool in tools:
-        if not isinstance(tool, Mapping):
-            continue
-        function = tool.get("function")
-        if not isinstance(function, Mapping):
-            continue
-        name = function.get("name")
-        parameters = function.get("parameters")
-        if isinstance(name, str) and isinstance(parameters, Mapping):
-            schemas[name] = dict(parameters)
-    return schemas
 
 
 def _body_tool_call_ids(body: Mapping[str, object]) -> list[str]:

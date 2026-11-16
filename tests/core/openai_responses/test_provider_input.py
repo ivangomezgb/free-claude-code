@@ -15,6 +15,37 @@ _KEEP_ALL_THINKING_EDIT = {
 }
 
 
+def test_raw_signed_thinking_keeps_readable_context_outside_opaque_item():
+    request = MessagesRequest.model_validate(
+        {
+            "model": "m",
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "thinking",
+                            "thinking": "Earlier summary",
+                            "signature": "old-cipher",
+                        },
+                        {"type": "text", "text": "Answer"},
+                    ],
+                }
+            ],
+        }
+    )
+    original = request.model_dump()
+    body = build_responses_provider_request(request, reasoning=ReasoningPolicy.on())
+    opaque, context = body["input"][:2]
+    assert opaque["encrypted_content"] == "old-cipher"
+    assert opaque["summary"] == []
+    assert "content" not in opaque
+    assert context["role"] == "assistant"
+    assert "Earlier summary" in json.dumps(context)
+    assert json.dumps(body).count("Earlier summary") == 1
+    assert request.model_dump() == original
+
+
 def test_build_responses_provider_request_preserves_multiturn_protocol() -> None:
     request = MessagesRequest.model_validate(
         {
@@ -83,12 +114,17 @@ def test_build_responses_provider_request_preserves_multiturn_protocol() -> None
     assert body["include"] == ["reasoning.encrypted_content"]
     assert body["reasoning"] == {"effort": "xhigh", "summary": "auto"}
     assert body["tool_choice"] == {"type": "function", "name": "lookup"}
+    assert body["input"][0]["id"].startswith("rs_")
+    assert body["input"][1]["id"].startswith("rs_")
+    assert body["input"][0]["id"] != body["input"][1]["id"]
     assert body["input"][0] == {
+        "id": body["input"][0]["id"],
         "type": "reasoning",
         "summary": [],
         "content": [{"type": "reasoning_text", "text": "summary"}],
     }
     assert body["input"][1] == {
+        "id": body["input"][1]["id"],
         "type": "reasoning",
         "summary": [],
         "encrypted_content": "opaque",

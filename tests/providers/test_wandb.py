@@ -33,8 +33,6 @@ def wandb_provider() -> OpenAIChatProvider:
         make_provider_config(
             api_key="test-wandb-key",
             base_url=WANDB_INFERENCE_DEFAULT_BASE,
-            rate_limit=10,
-            rate_window=60,
         ),
         admission=immediate_admission(provider_name="wandb"),
     )
@@ -80,7 +78,7 @@ def test_build_request_body_uses_provider_defaults_when_reasoning_is_inherited(
     assert "extra_body" not in body
 
 
-def test_build_request_body_drops_undocumented_reasoning_replay_but_keeps_tools(
+def test_build_request_body_uses_native_reasoning_field_and_keeps_tools(
     wandb_provider: OpenAIChatProvider,
 ) -> None:
     request = _request(
@@ -119,7 +117,8 @@ def test_build_request_body_drops_undocumented_reasoning_replay_but_keeps_tools(
 
     assert body["messages"][1] == {
         "role": "assistant",
-        "content": "[Earlier reasoning]\nRead it first.\n\nI will inspect it.",
+        "content": "I will inspect it.",
+        "reasoning": "Read it first.",
         "tool_calls": [
             {
                 "id": "toolu_1",
@@ -209,8 +208,6 @@ async def test_model_catalog_uses_documented_endpoint_and_bearer_auth() -> None:
             make_provider_config(
                 api_key="wire-wandb-key",
                 base_url=WANDB_INFERENCE_DEFAULT_BASE,
-                rate_limit=10,
-                rate_window=60,
             ),
             admission=immediate_admission(provider_name="wandb"),
         )

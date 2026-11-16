@@ -23,8 +23,12 @@ from free_claude_code.application.ports import (
 from free_claude_code.config.settings import Settings
 from free_claude_code.core.anthropic import MessagesRequest
 from free_claude_code.core.anthropic.streaming import format_sse_event
+from free_claude_code.core.gemini import GeminiRequest
+from free_claude_code.core.gemini.response import GeminiOutput
 from free_claude_code.core.openai_responses import OpenAIResponsesRequest
 from free_claude_code.core.reasoning import ReasoningPolicy
+from free_claude_code.core.stream_output import StreamOutput
+from free_claude_code.core.stream_recovery import ContinuationSeed
 from tests.web_tools_support import StubWebToolsClient
 
 
@@ -400,6 +404,18 @@ class _ControlledProvider:
         self.closed = asyncio.Event()
         self.request_ids: list[str] = []
 
+    async def stream_gemini(
+        self, _request: GeminiRequest, **kwargs
+    ) -> AsyncIterator[StreamOutput]:
+        self.request_ids.append(kwargs["request_id"])
+        try:
+            for chunk in self._chunks:
+                yield StreamOutput((chunk,))
+            self.blocked.set()
+            await asyncio.Event().wait()
+        finally:
+            self.closed.set()
+
     async def stream_messages(
         self,
         _request: MessagesRequest,
@@ -410,12 +426,13 @@ class _ControlledProvider:
         reasoning: ReasoningPolicy,
         request_headers: Mapping[str, str] | None = None,
         model_info: ProviderModelInfo | None = None,
-    ) -> AsyncIterator[str]:
+        continuation: ContinuationSeed | None = None,
+    ) -> AsyncIterator[StreamOutput]:
         del input_tokens, response_model, reasoning
         self.request_ids.append(request_id)
         try:
             for chunk in self._chunks:
-                yield chunk
+                yield StreamOutput((chunk,))
             self.blocked.set()
             await asyncio.Event().wait()
         finally:
@@ -430,12 +447,14 @@ class _ControlledProvider:
         response_model: str,
         reasoning: ReasoningPolicy,
         request_headers: Mapping[str, str] | None = None,
-    ) -> AsyncIterator[str]:
+        model_info: ProviderModelInfo | None = None,
+        continuation: ContinuationSeed | None = None,
+    ) -> AsyncIterator[StreamOutput]:
         del input_tokens, response_model, reasoning
         self.request_ids.append(request_id)
         try:
             for chunk in self._chunks:
-                yield chunk
+                yield StreamOutput((chunk,))
             self.blocked.set()
             await asyncio.Event().wait()
         finally:
@@ -456,11 +475,13 @@ class _Lease:
     def model_info(self, provider_id: str, model_id: str) -> ProviderModelInfo | None:
         return None
 
-    def is_provider_cached(self, provider_id: str) -> bool:
+    def is_provider_cached(self, provider_id: str, api_key_number: int = 1) -> bool:
         del provider_id
         return True
 
-    async def resolve_provider(self, provider_id: str) -> ProviderPort:
+    async def resolve_provider(
+        self, provider_id: str, api_key_number: int = 1
+    ) -> ProviderPort:
         assert provider_id == "nvidia_nim"
         return self._provider
 
@@ -554,7 +575,7 @@ async def _disconnect_real_app(
     payload: dict[str, object],
     provider: _ControlledProvider,
 ) -> tuple[list[Message], _Lease]:
-    settings = Settings(provider_progress_timeout=60.0)
+    settings = Settings()
     lease = _Lease(settings, cast(ProviderPort, provider))
     requests = _Requests(lease)
     app = create_app(
@@ -566,7 +587,9 @@ async def _disconnect_real_app(
         )
     )
     body = json.dumps(payload).encode()
-    scope = _http_scope(path)
+    route, _, query = path.partition("?")
+    scope = _http_scope(route)
+    scope["query_string"] = query.encode()
     scope["headers"] = [
         (b"content-type", b"application/json"),
         (b"content-length", str(len(body)).encode()),
@@ -617,6 +640,34 @@ def _responses_payload() -> dict[str, object]:
         "max_output_tokens": 32,
         "stream": True,
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize(
+    "part",
+    [
+        None,
+        {"text": "partial"},
+        {"functionCall": {"id": "a", "name": "read", "args": {}}},
+    ],
+)
+async def test_real_gemini_disconnect_closes_provider_and_lease(streaming, part):
+    output = GeminiOutput("lifetime", "public", include_thoughts=False)
+    provider = _ControlledProvider(tuple(output.part(part)) if part is not None else ())
+    suffix = "streamGenerateContent?alt=sse" if streaming else "generateContent"
+    sent, lease = await _disconnect_real_app(
+        path=f"/v1beta/models/public:{suffix}",
+        payload={"contents": [{"parts": [{"text": "hello"}]}]},
+        provider=provider,
+    )
+    assert lease.release_calls == 1
+    assert provider.closed.is_set()
+    if not streaming or part is None:
+        assert sent == []
+    else:
+        raw = b"".join(item.get("body", b"") for item in sent)
+        assert b'"error"' not in raw and b'"finishReason"' not in raw
 
 
 @pytest.mark.asyncio

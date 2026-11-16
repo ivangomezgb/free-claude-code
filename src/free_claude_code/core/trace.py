@@ -1,6 +1,6 @@
-"""Structured DEBUG traces for end-to-end request / CLI / provider logging.
+"""Structured DEBUG traces and stream cleanup warnings.
 
-Emitted lines are merged into JSON log rows by ``config.logging_config``.
+Trace payloads are preserved in ``record.extra.trace_payload`` by Loguru.
 Conversation and Claude Code prompts are logged verbatim unless values live under
 sanitized credential keys (e.g. ``api_key``, ``authorization``). The default
 INFO log level excludes these detailed request traces.
@@ -8,12 +8,18 @@ INFO log level excludes these detailed request traces.
 
 import asyncio
 import sys
-from collections.abc import AsyncGenerator, AsyncIterator, Mapping
-from typing import Any
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping
+from typing import Any, Protocol
 
 from loguru import logger
 
 from free_claude_code.core.async_iterators import try_close_async_iterator
+
+
+class _FramedOutput(Protocol):
+    @property
+    def frames(self) -> tuple[str, ...]: ...
+
 
 TRACE_PAYLOAD_BINDING = "trace_payload"
 
@@ -22,14 +28,18 @@ _SECRET_VALUE_KEYS = frozenset(
     for k in (
         "authorization",
         "x-api-key",
+        "x-goog-api-key",
+        "api-key",
         "anthropic-auth-token",
         "api_key",
+        "api_keys",
         "password",
         "secret",
         "token",
         "bearer_token",
         "openapi_token",
         "nvidia-api-key",
+        "aws_bearer_token_bedrock",
     )
 )
 
@@ -39,7 +49,17 @@ def sanitize_trace_value(obj: Any) -> Any:
     if isinstance(obj, Mapping):
         out: dict[str, Any] = {}
         for k, v in obj.items():
-            if str(k).lower() in _SECRET_VALUE_KEYS:
+            name = str(k).lower()
+            if name in _SECRET_VALUE_KEYS or name.replace("-", "_").endswith(
+                (
+                    "_api_key",
+                    "_api_keys",
+                    "_api_token",
+                    "_api_tokens",
+                    "_secret_key",
+                    "_secret_keys",
+                )
+            ):
                 out[str(k)] = "<redacted>"
             else:
                 out[str(k)] = sanitize_trace_value(v)
@@ -49,17 +69,29 @@ def sanitize_trace_value(obj: Any) -> Any:
     return obj
 
 
-def trace_event(*, stage: str, event: str, source: str, **fields: Any) -> None:
-    """Emit one structured DEBUG trace row merged into JSON by the log sink."""
-    payload = sanitize_trace_value(
-        {
-            "stage": stage,
-            "event": event,
-            "source": source,
-            **fields,
-        },
+def trace_event(
+    lazy_fields: Callable[[], Mapping[str, Any]] | None = None,
+    /,
+    *,
+    stage: str,
+    event: str,
+    source: str,
+    **fields: Any,
+) -> None:
+    """Defer sanitization and the optional field factory until DEBUG is enabled."""
+    logger.opt(lazy=True).debug(
+        "TRACE {}",
+        lambda: event,
+        trace_payload=lambda: sanitize_trace_value(
+            {
+                "stage": stage,
+                "event": event,
+                "source": source,
+                **fields,
+                **(lazy_fields() if lazy_fields is not None else {}),
+            }
+        ),
     )
-    logger.bind(trace_payload=payload).debug("TRACE {}", event)
 
 
 async def close_stream_input(
@@ -73,7 +105,7 @@ async def close_stream_input(
     close_error = await try_close_async_iterator(iterator)
     if close_error is None:
         return
-    trace_event(
+    logger.bind(
         stage="lifecycle",
         event="stream.input.close_failed",
         source=source,
@@ -82,7 +114,7 @@ async def close_stream_input(
         preserved_exc_type=(
             type(preserved_error).__name__ if preserved_error is not None else None
         ),
-    )
+    ).opt(exception=close_error).warning("Stream input cleanup failed")
 
 
 def extract_claude_session_id_from_headers(headers: Mapping[str, str]) -> str | None:
@@ -100,8 +132,8 @@ def extract_claude_session_id_from_headers(headers: Mapping[str, str]) -> str | 
     return None
 
 
-async def traced_async_stream(
-    agen: AsyncIterator[str],
+async def traced_async_stream[T: str | _FramedOutput](
+    agen: AsyncIterator[T],
     *,
     stage: str,
     source: str,
@@ -110,7 +142,7 @@ async def traced_async_stream(
     chunk_event: str | None = None,
     chunk_interval: int = 250,
     extra: Mapping[str, Any] | None = None,
-) -> AsyncGenerator[str]:
+) -> AsyncGenerator[T]:
     """Emit TRACE rows when a text stream completes, fails, cancels, or periodically."""
     common = dict(extra or {})
     count = 0
@@ -119,7 +151,10 @@ async def traced_async_stream(
     try:
         async for chunk in agen:
             count += 1
-            nbytes += len(chunk.encode("utf-8", errors="replace"))
+            nbytes += sum(
+                len(frame.encode("utf-8", errors="replace"))
+                for frame in ((chunk,) if isinstance(chunk, str) else chunk.frames)
+            )
             if chunk_event and chunk_interval > 0 and count % chunk_interval == 0:
                 trace_event(
                     stage=stage,

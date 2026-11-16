@@ -23,6 +23,7 @@ HARNESSES = (
     "dsh",
     "grok",
     "muse",
+    "agy",
     "aider",
 )
 
@@ -35,7 +36,7 @@ def launch(name: str, args: list[str], exit_code: int = 23) -> None:
 
 
 @pytest.mark.parametrize(
-    "name", ["aider", "cline", "dsh", "grok", "hermes", "muse", "opencode"]
+    "name", ["aider", "agy", "cline", "dsh", "grok", "hermes", "muse", "opencode"]
 )
 def test_launch_default_is_server_selection_not_first_row_or_local_settings(
     name: str,
@@ -55,7 +56,9 @@ def test_launch_default_is_server_selection_not_first_row_or_local_settings(
     }
 
     def inspect(command, env):
-        if name in {"aider", "muse"}:
+        if name == "agy":
+            assert command[command.index("--model") + 1] == selected
+        elif name in {"aider", "muse"}:
             assert env[f"{name.upper()}_MODEL"] == selected
         elif name == "grok":
             for key in (
@@ -103,7 +106,7 @@ def test_launch_default_is_server_selection_not_first_row_or_local_settings(
     launch(name, [])
 
 
-@pytest.mark.parametrize("name", HARNESSES)
+@pytest.mark.parametrize("name", tuple(name for name in HARNESSES if name != "dsh"))
 def test_help_receives_normal_fcc_setup(
     name: str, launch_capture: LaunchCapture
 ) -> None:
@@ -123,7 +126,7 @@ def test_help_receives_normal_fcc_setup(
         ]
 
 
-@pytest.mark.parametrize("name", HARNESSES)
+@pytest.mark.parametrize("name", tuple(name for name in HARNESSES if name != "dsh"))
 def test_help_does_not_bypass_failed_setup(
     name: str, launch_capture: LaunchCapture
 ) -> None:

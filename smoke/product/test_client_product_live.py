@@ -1,12 +1,13 @@
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
 import threading
 import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Generator
 from contextlib import contextmanager
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -14,13 +15,16 @@ from pathlib import Path
 
 import httpx
 import pytest
+from playwright.sync_api import Page
 
+from free_claude_code.config.env_migrations import atomic_write_managed_config
 from free_claude_code.config.paths import managed_env_path
 from free_claude_code.config.provider_catalog import PROVIDER_CATALOG
 from free_claude_code.core.json_types import JsonObject, JsonValue
 from smoke.lib.child_process import cmd_python_c
 from smoke.lib.claude_cli_matrix import run_claude_cli
 from smoke.lib.config import SmokeConfig
+from smoke.lib.dsh_provider import DshProvider, dsh_provider
 from smoke.lib.e2e import (
     ClientProtocolDriver,
     ConversationDriver,
@@ -45,6 +49,40 @@ def _json_object_lines(text: str) -> list[JsonObject]:
         if isinstance(value, dict):
             objects.append(value)
     return objects
+
+
+def _access_request_count(text: str, method: str, path: str) -> int:
+    request = re.compile(
+        rf' - "{re.escape(method)} {re.escape(path)} HTTP/\d(?:\.\d)?" \d{{3}}$'
+    )
+    return sum(
+        1
+        for row in _json_object_lines(text)
+        if isinstance(record := row.get("record"), dict)
+        and isinstance(message := record.get("message"), str)
+        and request.search(message) is not None
+    )
+
+
+def _seed_client_auth(home: Path, auth_token: str) -> None:
+    atomic_write_managed_config(
+        {"ANTHROPIC_AUTH_TOKEN": auth_token}, path=home / ".fcc" / ".env"
+    )
+
+
+def _trace_log_events(text: str) -> list[JsonObject]:
+    events: list[JsonObject] = []
+    for row in _json_object_lines(text):
+        record = row.get("record")
+        if not isinstance(record, dict):
+            continue
+        extra = record.get("extra")
+        if not isinstance(extra, dict):
+            continue
+        payload = extra.get("trace_payload")
+        if isinstance(payload, dict):
+            events.append(payload)
+    return events
 
 
 @pytest.mark.smoke_target("clients")
@@ -259,6 +297,7 @@ def test_aider_cli_prompt_e2e(smoke_config: SmokeConfig, tmp_path: Path) -> None
     auth_token = smoke_config.settings.proxy_auth_token
     isolated_home = tmp_path / "aider-home"
     isolated_home.mkdir()
+    _seed_client_auth(isolated_home, auth_token)
 
     with SmokeServerDriver(
         smoke_config,
@@ -328,6 +367,7 @@ def test_cline_cli_prompt_e2e(smoke_config: SmokeConfig, tmp_path: Path) -> None
     auth_token = smoke_config.settings.proxy_auth_token
     isolated_home = tmp_path / "cline-home"
     isolated_home.mkdir()
+    _seed_client_auth(isolated_home, auth_token)
 
     with SmokeServerDriver(
         smoke_config,
@@ -394,6 +434,7 @@ def test_hermes_cli_prompt_e2e(smoke_config: SmokeConfig, tmp_path: Path) -> Non
     isolated_home = tmp_path / "home"
     hermes_home = tmp_path / "hermes-home"
     isolated_home.mkdir()
+    _seed_client_auth(isolated_home, auth_token)
     hermes_home.mkdir()
     native_config = hermes_home / "config.yaml"
     native_env = hermes_home / ".env"
@@ -483,7 +524,7 @@ def test_hermes_cli_prompt_e2e(smoke_config: SmokeConfig, tmp_path: Path) -> Non
     assert result.stdout == f"{marker}\n"
     assert result.stderr == ""
     assert "GET /v1/models" in server_log
-    assert server_log.count("POST /v1/responses") == 1
+    assert _access_request_count(server_log, "POST", "/v1/responses") == 1
     assert "POST /v1/chat/completions" not in server_log
     assert [request["path"] for request in provider_requests] == [
         "/v1/chat/completions"
@@ -510,11 +551,9 @@ def test_dsh_cli_headless_e2e(smoke_config: SmokeConfig, tmp_path: Path) -> None
     auth_token = smoke_config.settings.proxy_auth_token
     credential_env_keys = _provider_credential_env_keys()
 
+    scenario = DshProvider(model_id, marker)
     with (
-        _successful_openai_provider(model_id=model_id, marker=marker) as (
-            provider_base_url,
-            provider_requests,
-        ),
+        dsh_provider(scenario) as provider_base_url,
         SmokeServerDriver(
             smoke_config,
             name="product-dsh-cli-headless",
@@ -549,17 +588,24 @@ def test_dsh_cli_headless_e2e(smoke_config: SmokeConfig, tmp_path: Path) -> None
         )
         server_log = server.log_path.read_text(encoding="utf-8", errors="replace")
 
+    (tmp_path / "dsh-provider-requests.json").write_text(
+        json.dumps(scenario.requests, indent=2), encoding="utf-8"
+    )
     combined = f"{result.stdout}\n{result.stderr}"
     assert result.returncode == 0, result.stderr or result.stdout
     assert result.stdout.strip() == marker
     assert auth_token not in combined
     assert "GET /v1/models" in server_log
-    assert server_log.count("POST /v1/responses") == 1
+    assert "POST /v1/responses" in server_log
     assert "POST /v1/chat/completions" not in server_log
-    assert [request["path"] for request in provider_requests] == [
-        "/v1/chat/completions"
-    ]
-    provider_body = provider_requests[0]["body"]
+    assert scenario.title_finished.is_set()
+    assert [request["purpose"] for request in scenario.requests].count("title") == 1
+    main = [request for request in scenario.requests if request["purpose"] == "main"]
+    assert len(main) == 1
+    assert all(
+        request["path"] == "/v1/chat/completions" for request in scenario.requests
+    )
+    provider_body = main[0]["body"]
     assert isinstance(provider_body, dict)
     assert provider_body["model"] == model_id
 
@@ -577,11 +623,9 @@ def test_dsh_cli_terminal_failure_e2e(
     full_model = "lmstudio/fcc-smoke-failing-model"
     auth_token = smoke_config.settings.proxy_auth_token
     credential_env_keys = _provider_credential_env_keys()
+    scenario = DshProvider("fcc-smoke-failing-model", "unused", failure="main")
     with (
-        _deliberately_failing_openai_provider() as (
-            provider_base_url,
-            provider_requests,
-        ),
+        dsh_provider(scenario) as provider_base_url,
         SmokeServerDriver(
             smoke_config,
             name="product-dsh-cli-provider-error",
@@ -619,12 +663,139 @@ def test_dsh_cli_terminal_failure_e2e(
     combined = f"{result.stdout}\n{result.stderr}"
     assert result.returncode != 0
     assert auth_token not in combined
-    assert server_log.count("POST /v1/responses") == 1
-    assert provider_requests == ["/v1/chat/completions"]
+    assert "POST /v1/responses" in server_log
+    assert [request["purpose"] for request in scenario.requests].count("main") == 1
+    assert [request["purpose"] for request in scenario.requests].count("title") == 1
+    assert scenario.title_finished.is_set()
 
 
 @pytest.mark.smoke_target("clients")
-def test_dsh_cli_web_startup_e2e(smoke_config: SmokeConfig, tmp_path: Path) -> None:
+@pytest.mark.parametrize("title_failure", [False, True])
+def test_dsh_cli_tools_and_resume_e2e(
+    smoke_config: SmokeConfig,
+    tmp_path: Path,
+    title_failure: bool,
+) -> None:
+    if not shutil.which("dsh") or not (uv_bin := shutil.which("uv")):
+        pytest.skip("missing_env: DeepSeek Harness and uv are required")
+    witness = tmp_path / "witness.txt"
+    witness.write_text("FCC_NATIVE_TOOL_WITNESS", encoding="utf-8")
+    model_id = "fcc-smoke-dsh-tools"
+    full_model = f"lmstudio/{model_id}"
+    scenario = DshProvider(
+        model_id,
+        "FCC_TOOL_DONE",
+        failure="title" if title_failure else "none",
+        read_path=str(witness),
+    )
+    credentials = _provider_credential_env_keys()
+    with (
+        dsh_provider(scenario) as provider_url,
+        SmokeServerDriver(
+            smoke_config,
+            name="product-dsh-tools",
+            env_overrides=_local_provider_overrides(full_model, provider_url),
+            env_unset=credentials,
+        ).run() as server,
+    ):
+        env = _isolated_dsh_env(
+            tmp_path=tmp_path,
+            server_port=server.port,
+            auth_token=smoke_config.settings.proxy_auth_token,
+            credential_env_keys=credentials,
+        )
+        patch = tmp_path / "reasoning.patch.yml"
+        patch.write_text(
+            json.dumps(
+                [
+                    {
+                        "id": "agent-default-model",
+                        "config": {
+                            "provider": "free-claude-code",
+                            "model": full_model,
+                            "reasoningEffort": "high",
+                        },
+                    }
+                ]
+            ),
+            encoding="utf-8",
+        )
+        command = [
+            uv_bin,
+            "run",
+            "--project",
+            str(smoke_config.root),
+            "--no-sync",
+            "fcc-dsh",
+            "headless",
+            "--patch",
+            str(patch),
+            "--json",
+        ]
+        first = subprocess.run(
+            [*command, "Read witness.txt and reply FCC_TOOL_DONE"],
+            cwd=tmp_path,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=smoke_config.timeout_s + 30,
+        )
+        assert first.returncode == 0, first.stdout + first.stderr
+        events = _json_object_lines(first.stdout)
+        (tmp_path / "dsh-tool-events.json").write_text(
+            json.dumps(events, indent=2), encoding="utf-8"
+        )
+        assert any(
+            event.get("type") == "thinking"
+            and event.get("text") == "Reading the local fixture."
+            for event in events
+        )
+        assert any(
+            event.get("type") == "tool_result"
+            and "FCC_NATIVE_TOOL_WITNESS" in str(event.get("result"))
+            for event in events
+        )
+        assert any(
+            event.get("type") == "final" and event.get("text") == "FCC_TOOL_DONE"
+            for event in events
+        )
+        session_id = next(
+            event["sessionId"] for event in events if event.get("type") == "session"
+        )
+        assert isinstance(session_id, str)
+        assert scenario.title_finished.is_set()
+        before_resume = len(scenario.requests)
+        resumed = subprocess.run(
+            [*command, "--session-id", session_id, "Continue the same task."],
+            cwd=tmp_path,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=smoke_config.timeout_s + 30,
+        )
+        assert resumed.returncode == 0, resumed.stdout + resumed.stderr
+        resumed_events = _json_object_lines(resumed.stdout)
+        assert any(
+            event.get("type") == "final" and event.get("text") == "FCC_TOOL_DONE"
+            for event in resumed_events
+        )
+    (tmp_path / "dsh-tool-requests.json").write_text(
+        json.dumps(scenario.requests, indent=2), encoding="utf-8"
+    )
+    main = [request for request in scenario.requests if request["purpose"] == "main"]
+    assert len(main) == 3
+    assert [request["purpose"] for request in scenario.requests].count("title") == 1
+    assert all(
+        request["purpose"] == "main" for request in scenario.requests[before_resume:]
+    )
+    assert "FCC_NATIVE_TOOL_WITNESS" in json.dumps(main[-1]["body"])
+
+
+@pytest.mark.smoke_target("clients")
+@pytest.mark.parametrize("workflow", ["chat", "cancel", "approval", "compact"])
+def test_dsh_cli_web_startup_e2e(
+    smoke_config: SmokeConfig, tmp_path: Path, page: Page, workflow: str
+) -> None:
     if not shutil.which("dsh"):
         pytest.skip("missing_env: DeepSeek Harness not found")
     uv_bin = shutil.which("uv")
@@ -636,11 +807,23 @@ def test_dsh_cli_web_startup_e2e(smoke_config: SmokeConfig, tmp_path: Path) -> N
     auth_token = smoke_config.settings.proxy_auth_token
     credential_env_keys = _provider_credential_env_keys()
     web_port = find_free_port()
+    scenario = DshProvider(model_id, "FCC_WEB_DONE")
+    if workflow == "cancel":
+        scenario.hold_release = threading.Event()
+    elif workflow == "approval":
+        scenario.tool_call = (
+            "pwsh" if os.name == "nt" else "bash",
+            {
+                "command": "Write-Output 'FCC_APPROVAL_DONE'"
+                if os.name == "nt"
+                else "printf FCC_APPROVAL_DONE",
+                "description": "Print a local approval fixture marker",
+                "sandbox_permissions": "danger-full-access",
+                "justification": "Allow this local smoke test to print its fixed marker.",
+            },
+        )
     with (
-        _successful_openai_provider(model_id=model_id, marker="unused") as (
-            provider_base_url,
-            provider_requests,
-        ),
+        dsh_provider(scenario) as provider_base_url,
         SmokeServerDriver(
             smoke_config,
             name="product-dsh-cli-web",
@@ -654,6 +837,26 @@ def test_dsh_cli_web_startup_e2e(smoke_config: SmokeConfig, tmp_path: Path) -> N
             auth_token=auth_token,
             credential_env_keys=credential_env_keys,
         )
+        patches = []
+        if workflow == "compact":
+            patch = tmp_path / "compact.patch.yml"
+            patch.write_text(
+                json.dumps(
+                    [
+                        {
+                            "id": "compaction-basic",
+                            "config": {
+                                "retainTokens": 32,
+                                "headroomTokens": 1024,
+                                "maxTokens": 512,
+                                "auto": False,
+                            },
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            patches = ["--patch", str(patch)]
         command = [
             uv_bin,
             "run",
@@ -662,11 +865,24 @@ def test_dsh_cli_web_startup_e2e(smoke_config: SmokeConfig, tmp_path: Path) -> N
             "--no-sync",
             "fcc-dsh",
             "web",
+            *patches,
             "--no-open",
             "--port",
             str(web_port),
         ]
-        process = _start_attached_process(command, cwd=tmp_path, env=env)
+        log_path = tmp_path / "dsh-web.log"
+        output = log_path.open("w", encoding="utf-8")
+        process = subprocess.Popen(
+            command,
+            cwd=tmp_path,
+            env=env,
+            stdout=output,
+            stderr=output,
+            text=True,
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
+            start_new_session=os.name != "nt",
+        )
+        startup_error = None
         try:
             _wait_for_web_root(
                 process,
@@ -674,14 +890,101 @@ def test_dsh_cli_web_startup_e2e(smoke_config: SmokeConfig, tmp_path: Path) -> N
                 timeout_s=smoke_config.timeout_s + 30,
             )
             assert process.poll() is None
+            deadline = time.monotonic() + 10
+            login = None
+            while time.monotonic() < deadline:
+                login = re.search(
+                    r"dsh web: (http://\S+)", log_path.read_text(encoding="utf-8")
+                )
+                if login:
+                    break
+                time.sleep(0.1)
+            assert login is not None, "DSH did not print its authenticated browser URL"
+            page.goto(login[1])
+            page.get_by_role("button", name="Continue", exact=True).click(timeout=30000)
+            page.get_by_text("Preview Notice", exact=True).wait_for(
+                state="hidden", timeout=30000
+            )
+            composer = page.locator('[contenteditable="true"]')
+            composer.wait_for(timeout=30000)
+            assert "token=" not in page.url
+            composer.click()
+            page.keyboard.insert_text(
+                "Remember these fixture facts: " + "recorded fact " * 200
+                if workflow == "compact"
+                else "Reply FCC_WEB_DONE"
+            )
+            page.get_by_role("button", name="Send message", exact=True).click()
+            if workflow == "approval":
+                page.get_by_role("button", name="Allow once", exact=True).click(
+                    timeout=30000
+                )
+            if workflow == "cancel":
+                assert scenario.hold_started.wait(10)
+                assert scenario.hold_release is not None
+                page.get_by_role("button", name="Stop generating", exact=True).click()
+                page.get_by_role("button", name="Stop generating", exact=True).wait_for(
+                    state="hidden", timeout=10000
+                )
+                scenario.hold_release.set()
+            else:
+                page.get_by_text("FCC_WEB_DONE", exact=True).wait_for(timeout=30000)
+            if workflow == "compact":
+                composer.click()
+                page.keyboard.insert_text("Remember the second fixture turn.")
+                page.get_by_role("button", name="Send message", exact=True).click()
+                page.get_by_text("FCC_WEB_DONE", exact=True).nth(1).wait_for(
+                    timeout=30000
+                )
+                composer.click()
+                composer.press_sequentially("/compact")
+                composer.press("Enter")
+                page.get_by_text(re.compile(r"Compacted \d+ history items")).wait_for(
+                    timeout=30000
+                )
+                scenario.marker = "FCC_AFTER_COMPACTION"
+                composer.click()
+                page.keyboard.insert_text("Finish after compaction.")
+                page.get_by_role("button", name="Send message", exact=True).click()
+                page.get_by_text("FCC_AFTER_COMPACTION", exact=True).wait_for(
+                    timeout=30000
+                )
+        except AssertionError as exc:
+            startup_error = exc
         finally:
-            stdout, stderr = _stop_attached_process(process)
+            if scenario.hold_release is not None:
+                scenario.hold_release.set()
+            page.screenshot(path=str(tmp_path / "dsh-web.png"))
+            (tmp_path / "dsh-web-body.txt").write_text(
+                page.locator("body").inner_text(), encoding="utf-8"
+            )
+            _stop_attached_process(process)
+            output.close()
+            stdout = log_path.read_text(encoding="utf-8")
+            stderr = ""
+        if startup_error is not None:
+            raise AssertionError(
+                f"{startup_error}\n{stdout}\n{stderr}"
+            ) from startup_error
         server_log = server.log_path.read_text(encoding="utf-8", errors="replace")
 
     assert process.poll() is not None
     assert auth_token not in f"{stdout}\n{stderr}"
     assert "GET /v1/models" in server_log
-    assert provider_requests == []
+    (tmp_path / "dsh-web-requests.json").write_text(
+        json.dumps(scenario.requests, indent=2), encoding="utf-8"
+    )
+    main = [
+        request["body"] for request in scenario.requests if request["purpose"] == "main"
+    ]
+    assert len(main) == (
+        3 if workflow == "compact" else 2 if workflow == "approval" else 1
+    )
+    if workflow == "compact":
+        assert sum(item["purpose"] == "compaction" for item in scenario.requests) == 1
+        assert "compacted-summary" in json.dumps(main[-1])
+    if workflow == "approval":
+        assert "FCC_APPROVAL_DONE" in json.dumps(main[-1])
 
 
 @pytest.mark.smoke_target("clients")
@@ -712,6 +1015,7 @@ def test_grok_cli_headless_e2e(smoke_config: SmokeConfig, tmp_path: Path) -> Non
     ):
         isolated_home = tmp_path / "grok-home"
         isolated_home.mkdir()
+        _seed_client_auth(isolated_home, auth_token)
         env = os.environ.copy()
         for key in credential_env_keys:
             env.pop(key, None)
@@ -756,7 +1060,7 @@ def test_grok_cli_headless_e2e(smoke_config: SmokeConfig, tmp_path: Path) -> Non
     assert marker in result.stdout
     assert auth_token not in combined
     assert "GET /v1/models?view=responses" in server_log
-    responses_count = server_log.count("POST /v1/responses")
+    responses_count = _access_request_count(server_log, "POST", "/v1/responses")
     assert responses_count >= 1
     assert "POST /v1/chat/completions" not in server_log
     assert responses_count == len(provider_requests)
@@ -797,6 +1101,7 @@ def test_muse_cli_headless_e2e(smoke_config: SmokeConfig, tmp_path: Path) -> Non
     ):
         isolated_home = tmp_path / "muse-home"
         isolated_home.mkdir()
+        _seed_client_auth(isolated_home, auth_token)
         env = os.environ.copy()
         for key in credential_env_keys:
             env.pop(key, None)
@@ -867,13 +1172,15 @@ def test_muse_cli_headless_e2e(smoke_config: SmokeConfig, tmp_path: Path) -> Non
     )
     assert catalog_files, "Muse did not persist its parsed provider catalog"
     visible_models = {
-        row["model_id"]
+        row["model_id"]: row
         for catalog_file in catalog_files
         for row in json.loads(catalog_file.read_text(encoding="utf-8"))["rows"]
         if row["visibility"] == "visible"
     }
     assert full_model in visible_models, "Muse hides the configured FCC model"
-    responses_count = server_log.count("POST /v1/responses")
+    assert visible_models[full_model]["context_limit"] == 200000
+    assert visible_models[full_model]["output_limit"] == 81920
+    responses_count = _access_request_count(server_log, "POST", "/v1/responses")
     assert responses_count >= 1
     assert responses_count == len(provider_requests)
     assert "POST /v1/chat/completions" not in server_log
@@ -985,7 +1292,7 @@ def test_claude_cli_web_search_e2e(smoke_config: SmokeConfig, tmp_path: Path) ->
     assert '"type": "server_tool_use"' in automatic_payload
     assert '"type": "web_search_tool_result"' in automatic_payload
     assert "github.com" in automatic_payload
-    log_rows = _json_object_lines(server_log)
+    log_rows = _trace_log_events(server_log)
     assert (
         sum(
             row.get("event") == "free_claude_code.api.web_search.automatic_recognized"
@@ -1087,7 +1394,7 @@ def test_claude_auto_mode_openai_connected_e2e(
     ):
         assert unexpected not in combined_lower
 
-    log_rows = _json_object_lines(server_log)
+    log_rows = _trace_log_events(server_log)
     policy_rows = [
         row
         for row in log_rows
@@ -1191,7 +1498,38 @@ def _isolated_dsh_env(
     isolated_home = tmp_path / "home"
     dsh_home = tmp_path / "dsh-home"
     isolated_home.mkdir(exist_ok=True)
+    _seed_client_auth(isolated_home, auth_token)
     dsh_home.mkdir(exist_ok=True)
+    # DSH otherwise resolves the OS Documents folder even with an isolated HOME.
+    storage = dsh_home / "storages"
+    storage.mkdir(exist_ok=True)
+    workspace_id = str(uuid.uuid4())
+    (storage / "workspace.json").write_text(
+        json.dumps(
+            {
+                "unit": {"name": "workspace", "version": 2},
+                "global": {
+                    "initialized": True,
+                    "workspaceIds": [workspace_id],
+                    "archivedSessionIds": [],
+                    "pinnedSessionIds": [],
+                    "defaultWorkspaceId": workspace_id,
+                },
+                "tables": {
+                    "workspaces": {
+                        workspace_id: {
+                            "path": str(tmp_path),
+                            "title": "Smoke workspace",
+                            "sessionIds": [],
+                            "createdAt": "2026-01-01T00:00:00.000Z",
+                            "updatedAt": "2026-01-01T00:00:00.000Z",
+                        }
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
 
     env = os.environ.copy()
     for key in credential_env_keys:
@@ -1247,7 +1585,8 @@ def _wait_for_web_root(
             break
         try:
             response = httpx.get(url, timeout=2.0, follow_redirects=True)
-            if response.status_code == HTTPStatus.OK:
+            # DSH now protects the Web root with its per-launch browser token.
+            if response.status_code in (HTTPStatus.OK, HTTPStatus.UNAUTHORIZED):
                 return
             last_error = f"HTTP {response.status_code}: {response.text[:200]}"
         except httpx.HTTPError as exc:
@@ -1283,7 +1622,7 @@ def _stop_attached_process(process: subprocess.Popen[str]) -> tuple[str, str]:
 
 
 @contextmanager
-def _deliberately_failing_openai_provider() -> Iterator[tuple[str, list[str]]]:
+def _deliberately_failing_openai_provider() -> Generator[tuple[str, list[str]]]:
     provider_requests: list[str] = []
 
     class Handler(BaseHTTPRequestHandler):
@@ -1348,7 +1687,7 @@ def _deliberately_failing_openai_provider() -> Iterator[tuple[str, list[str]]]:
 @contextmanager
 def _successful_openai_provider(
     *, model_id: str, marker: str
-) -> Iterator[tuple[str, list[JsonObject]]]:
+) -> Generator[tuple[str, list[JsonObject]]]:
     provider_requests: list[JsonObject] = []
 
     class Handler(BaseHTTPRequestHandler):

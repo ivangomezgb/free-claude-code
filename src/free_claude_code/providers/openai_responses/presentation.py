@@ -1,16 +1,17 @@
 """Client-protocol presenters for the shared Responses transport."""
 
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
 from typing import Protocol
 
 from free_claude_code.core.failures import ExecutionFailure
+from free_claude_code.core.history_replay import ReplayOrigin
 from free_claude_code.core.json_types import JsonObject
 from free_claude_code.core.openai_responses import (
     NativeResponsesRelay,
     ResponsesProviderStream,
     ResponsesStreamFailure,
     ResponsesToolEventAdapter,
+    format_response_sse_event,
 )
 
 
@@ -32,6 +33,10 @@ class ResponsesStreamPresenter(Protocol):
         raw_error: Exception,
         failure: ExecutionFailure,
     ) -> Iterable[str]: ...
+
+    def failure_payload(
+        self, raw_error: Exception, failure: ExecutionFailure
+    ) -> JsonObject | None: ...
 
 
 class MessagesResponsesPresenter:
@@ -61,6 +66,9 @@ class MessagesResponsesPresenter:
     ) -> Iterable[str]:
         del raw_error, failure
         return self._stream.ledger.close_unclosed_blocks()
+
+    def failure_payload(self, raw_error: Exception, failure: ExecutionFailure) -> None:
+        return None
 
 
 class NativeResponsesPresenter:
@@ -96,20 +104,27 @@ class NativeResponsesPresenter:
         raw_error: Exception,
         failure: ExecutionFailure,
     ) -> Iterable[str]:
+        return (
+            format_response_sse_event(
+                "response.failed", self.failure_payload(raw_error, failure)
+            ),
+        )
+
+    def failure_payload(
+        self, raw_error: Exception, failure: ExecutionFailure
+    ) -> JsonObject:
         if (
             isinstance(raw_error, ResponsesStreamFailure)
             and raw_error.event_type == "response.failed"
             and raw_error.payload is not None
         ):
-            return self.feed(raw_error.event_type, raw_error.payload)
-        return (self._relay.synthesize_failure(failure),)
+            payload = raw_error.payload
+            if self._tool_events is not None:
+                ((_, payload),) = self._tool_events.feed("response.failed", payload)
+            return self._relay.project("response.failed", payload)
+        return self._relay.failure_payload(failure)
 
 
-@dataclass(slots=True)
-class ResponsesExecutionOutcome:
-    """Provider outcome retained when terminal failure is consumed on-wire."""
-
-    failure: Exception | None = None
-
-
-type ResponsesPresenterFactory = Callable[[], ResponsesStreamPresenter]
+type ResponsesPresenterFactory = Callable[
+    [bool, ReplayOrigin], ResponsesStreamPresenter
+]

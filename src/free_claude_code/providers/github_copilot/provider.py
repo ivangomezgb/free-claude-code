@@ -4,6 +4,7 @@ import asyncio
 import sys
 from collections.abc import AsyncIterator, Mapping
 from contextlib import suppress
+from dataclasses import replace
 
 import httpx
 import httpx2
@@ -12,15 +13,20 @@ from openai import AsyncOpenAI
 from free_claude_code.application.errors import InvalidRequestError
 from free_claude_code.application.model_metadata import ProviderModelInfo
 from free_claude_code.core.anthropic.models import MessagesRequest
+from free_claude_code.core.chat_completions.request import ChatRequest
 from free_claude_code.core.failures import ExecutionFailure, FailureKind
+from free_claude_code.core.gemini import GeminiRequest
 from free_claude_code.core.openai_responses import OpenAIResponsesRequest
 from free_claude_code.core.reasoning import DEFAULT_REASONING_POLICY, ReasoningPolicy
+from free_claude_code.core.stream_output import StreamOutput
+from free_claude_code.core.stream_recovery import ContinuationSeed
 from free_claude_code.providers.admission import ProviderAdmissionController
 from free_claude_code.providers.anthropic_messages.transport import (
     AnthropicMessagesTransport,
 )
 from free_claude_code.providers.base import BaseProvider, ProviderConfig
 from free_claude_code.providers.endpoint_types import EndpointContext, HttpEndpoint
+from free_claude_code.providers.history_negotiation import HistoryModeCache
 from free_claude_code.providers.http import close_provider_stream
 from free_claude_code.providers.openai_chat import (
     OpenAIChatBehavior,
@@ -58,7 +64,11 @@ class _MessagesEndpoint:
     async def endpoint(self, *, force_refresh: bool = False) -> HttpEndpoint:
         snapshot = await self._context.endpoint(force_refresh=force_refresh)
         self._client.cookies.clear()
-        return snapshot
+        base_url = snapshot.base_url.rstrip("/")
+        return replace(
+            snapshot,
+            base_url=base_url if base_url.endswith("/v1") else base_url + "/v1",
+        )
 
 
 class GitHubCopilotProvider(BaseProvider):
@@ -70,10 +80,11 @@ class GitHubCopilotProvider(BaseProvider):
         *,
         auth: CopilotAuthManager,
         admission: ProviderAdmissionController,
+        history_cache: HistoryModeCache | None = None,
         messages_transport: httpx.AsyncBaseTransport | None = None,
         openai_transport: httpx2.AsyncBaseTransport | None = None,
     ) -> None:
-        super().__init__(config)
+        super().__init__(config, history_cache=history_cache)
         self._auth = auth
         self._admission = admission
         self._messages_pool = messages_transport or httpx.AsyncHTTPTransport(
@@ -95,6 +106,7 @@ class GitHubCopilotProvider(BaseProvider):
         self._responses = OpenAIResponsesTransport(
             client=self._client,
             admission=admission,
+            history_cache=self._history_cache,
             provider_name=PROVIDER_NAME,
             read_timeout_s=config.http_read_timeout,
             log_raw_sse_events=config.log_raw_sse_events,
@@ -137,7 +149,8 @@ class GitHubCopilotProvider(BaseProvider):
         reasoning: ReasoningPolicy = DEFAULT_REASONING_POLICY,
         request_headers: Mapping[str, str] | None = None,
         model_info: ProviderModelInfo | None = None,
-    ) -> AsyncIterator[str]:
+        continuation: ContinuationSeed | None = None,
+    ) -> AsyncIterator[StreamOutput]:
         self._check_model(request.model)
         return self._dispatch(
             request,
@@ -145,6 +158,51 @@ class GitHubCopilotProvider(BaseProvider):
             request_id,
             response_model or request.model,
             reasoning,
+            continuation=continuation,
+        )
+
+    def stream_chat(
+        self,
+        request: ChatRequest,
+        input_tokens: int = 0,
+        *,
+        request_id: str | None = None,
+        response_model: str | None = None,
+        reasoning: ReasoningPolicy = DEFAULT_REASONING_POLICY,
+        request_headers: Mapping[str, str] | None = None,
+        model_info: ProviderModelInfo | None = None,
+        continuation: ContinuationSeed | None = None,
+    ) -> AsyncIterator[StreamOutput]:
+        self._check_model(request.model)
+        return self._dispatch(
+            request,
+            input_tokens,
+            request_id,
+            response_model or request.model,
+            reasoning,
+            continuation=continuation,
+        )
+
+    def stream_gemini(
+        self,
+        request: GeminiRequest,
+        input_tokens: int = 0,
+        *,
+        request_id: str | None = None,
+        response_model: str | None = None,
+        reasoning: ReasoningPolicy = DEFAULT_REASONING_POLICY,
+        request_headers: Mapping[str, str] | None = None,
+        model_info: ProviderModelInfo | None = None,
+        continuation: ContinuationSeed | None = None,
+    ) -> AsyncIterator[StreamOutput]:
+        self._check_model(request.model)
+        return self._dispatch(
+            request,
+            input_tokens,
+            request_id,
+            response_model or request.model,
+            reasoning,
+            continuation=continuation,
         )
 
     def stream_responses(
@@ -156,7 +214,9 @@ class GitHubCopilotProvider(BaseProvider):
         response_model: str | None = None,
         reasoning: ReasoningPolicy = DEFAULT_REASONING_POLICY,
         request_headers: Mapping[str, str] | None = None,
-    ) -> AsyncIterator[str]:
+        model_info: ProviderModelInfo | None = None,
+        continuation: ContinuationSeed | None = None,
+    ) -> AsyncIterator[StreamOutput]:
         self._check_model(request.model)
         return self._dispatch(
             request,
@@ -164,6 +224,7 @@ class GitHubCopilotProvider(BaseProvider):
             request_id,
             response_model or request.model,
             reasoning,
+            continuation=continuation,
         )
 
     def _chat(self, model: CopilotModel) -> OpenAIChatTransport:
@@ -175,6 +236,7 @@ class GitHubCopilotProvider(BaseProvider):
                 log_raw_sse_events=self._config.log_raw_sse_events,
                 log_api_error_tracebacks=self._config.log_api_error_tracebacks,
                 admission=self._admission,
+                history_cache=self._history_cache,
                 client=self._client,
                 endpoint_transport=self._openai_pool,
             )
@@ -184,18 +246,19 @@ class GitHubCopilotProvider(BaseProvider):
 
     async def _dispatch(
         self,
-        request: MessagesRequest | OpenAIResponsesRequest,
+        request: MessagesRequest | OpenAIResponsesRequest | GeminiRequest | ChatRequest,
         input_tokens: int,
         request_id: str | None,
         response_model: str,
         reasoning: ReasoningPolicy,
-    ) -> AsyncIterator[str]:
+        continuation: ContinuationSeed | None = None,
+    ) -> AsyncIterator[StreamOutput]:
         async with self._condition:
             self._check_model(request.model)
             self._active += 1
         try:
             async with self._auth.lease(request.model) as lease:
-                selected: AsyncIterator[str] | None = None
+                selected: AsyncIterator[StreamOutput] | None = None
                 http: httpx.AsyncClient | None = None
                 try:
                     if lease.egress is CopilotEgress.MESSAGES:
@@ -211,13 +274,34 @@ class GitHubCopilotProvider(BaseProvider):
                         native = AnthropicMessagesTransport(
                             client=http,
                             admission=self._admission,
+                            history_cache=self._history_cache,
                             provider_name=PROVIDER_NAME,
                             replay_scope=REPLAY_SCOPE,
                             read_timeout_s=self._config.http_read_timeout,
                             capabilities=lease.model.messages,
                         )
                         endpoint = _MessagesEndpoint(lease, http)
-                        if isinstance(request, MessagesRequest):
+                        if isinstance(request, ChatRequest):
+                            selected = native.stream_chat(
+                                request,
+                                endpoint_context=endpoint,
+                                request_id=request_id,
+                                response_model=response_model,
+                                reasoning=reasoning,
+                                model_info=lease.model.info,
+                                continuation=continuation,
+                            )
+                        elif isinstance(request, GeminiRequest):
+                            selected = native.stream_gemini(
+                                request,
+                                endpoint_context=endpoint,
+                                request_id=request_id,
+                                response_model=response_model,
+                                reasoning=reasoning,
+                                model_info=lease.model.info,
+                                continuation=continuation,
+                            )
+                        elif isinstance(request, MessagesRequest):
                             selected = native.stream_messages(
                                 request,
                                 endpoint_context=endpoint,
@@ -225,6 +309,7 @@ class GitHubCopilotProvider(BaseProvider):
                                 response_model=response_model,
                                 reasoning=reasoning,
                                 model_info=lease.model.info,
+                                continuation=continuation,
                             )
                         else:
                             selected = native.stream_responses(
@@ -233,6 +318,7 @@ class GitHubCopilotProvider(BaseProvider):
                                 request_id=request_id,
                                 response_model=response_model,
                                 reasoning=reasoning,
+                                continuation=continuation,
                             )
                     else:
                         resolved = non_messages_reasoning(
@@ -243,7 +329,27 @@ class GitHubCopilotProvider(BaseProvider):
                             if lease.egress is CopilotEgress.RESPONSES
                             else self._chat(lease.model)
                         )
-                        if isinstance(request, MessagesRequest):
+                        if isinstance(request, ChatRequest):
+                            selected = transport.stream_chat(
+                                request,
+                                input_tokens=input_tokens,
+                                request_id=request_id,
+                                response_model=response_model,
+                                reasoning=resolved,
+                                endpoint_context=lease,
+                                continuation=continuation,
+                            )
+                        elif isinstance(request, GeminiRequest):
+                            selected = transport.stream_gemini(
+                                request,
+                                input_tokens=input_tokens,
+                                request_id=request_id,
+                                response_model=response_model,
+                                reasoning=resolved,
+                                endpoint_context=lease,
+                                continuation=continuation,
+                            )
+                        elif isinstance(request, MessagesRequest):
                             if lease.egress is CopilotEgress.RESPONSES:
                                 selected = self._responses.stream_messages(
                                     request,
@@ -255,6 +361,7 @@ class GitHubCopilotProvider(BaseProvider):
                                     model_info=lease.model.info,
                                     can_disable_reasoning="none"
                                     in (lease.model.supported_efforts or ()),
+                                    continuation=continuation,
                                 )
                             else:
                                 selected = self._chat(lease.model).stream_messages(
@@ -265,6 +372,7 @@ class GitHubCopilotProvider(BaseProvider):
                                     reasoning=resolved,
                                     endpoint_context=lease,
                                     model_info=lease.model.info,
+                                    continuation=continuation,
                                 )
                         else:
                             selected = transport.stream_responses(
@@ -274,6 +382,7 @@ class GitHubCopilotProvider(BaseProvider):
                                 response_model=response_model,
                                 reasoning=resolved,
                                 endpoint_context=lease,
+                                continuation=continuation,
                             )
                     while True:
                         try:
@@ -322,7 +431,7 @@ class GitHubCopilotProvider(BaseProvider):
 
 
 async def _close_request(
-    stream: AsyncIterator[str] | None,
+    stream: AsyncIterator[StreamOutput] | None,
     client: httpx.AsyncClient | None,
     *,
     active_error: BaseException | None,
@@ -350,11 +459,11 @@ async def _endpoint_required() -> str:
     )
 
 
-async def _advance(stream: AsyncIterator[str]) -> str:
+async def _advance(stream: AsyncIterator[StreamOutput]) -> StreamOutput:
     return await anext(stream)
 
 
-async def _next_event(stream: AsyncIterator[str]) -> str:
+async def _next_event(stream: AsyncIterator[StreamOutput]) -> StreamOutput:
     # Cancel transport work once, then protect its response-close finally blocks
     # from repeated caller cancellation before releasing the account lease.
     task = asyncio.create_task(_advance(stream))

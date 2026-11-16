@@ -11,6 +11,7 @@ from openai import AuthenticationError
 
 from free_claude_code.application.errors import InvalidRequestError
 from free_claude_code.application.model_metadata import ProviderModelInfo
+from free_claude_code.config.constants import PROVIDER_MAX_ATTEMPTS_DEFAULT
 from free_claude_code.core.anthropic.models import MessagesRequest
 from free_claude_code.core.anthropic.stream_contracts import (
     assert_anthropic_stream_contract,
@@ -21,8 +22,10 @@ from free_claude_code.core.failures import ExecutionFailure, FailureKind
 from free_claude_code.core.model_capabilities import ModelInputModality
 from free_claude_code.core.openai_responses import OpenAIResponsesRequest
 from free_claude_code.core.reasoning import ReasoningEffort, ReasoningPolicy
+from free_claude_code.core.stream_output import StreamOutput
 from free_claude_code.providers.admission import ProviderAdmissionController
 from free_claude_code.providers.base import ProviderConfig
+from free_claude_code.providers.openai_codex import provider as codex_provider_module
 from free_claude_code.providers.openai_codex.auth import (
     OpenAIAccess,
     OpenAIAuthManager,
@@ -92,9 +95,6 @@ def _config() -> ProviderConfig:
     return make_provider_config(
         api_key="",
         base_url="https://chatgpt.com/backend-api/codex",
-        rate_limit=100,
-        rate_window=1,
-        max_concurrency=2,
     )
 
 
@@ -186,8 +186,8 @@ def _complete_stream(text: str) -> str:
     )
 
 
-async def _collect(stream: AsyncIterator[str]) -> str:
-    return "".join([chunk async for chunk in stream])
+async def _collect(stream: AsyncIterator[StreamOutput]) -> str:
+    return "".join([frame async for chunk in stream for frame in chunk.frames])
 
 
 @pytest.mark.asyncio
@@ -257,6 +257,51 @@ async def test_streamed_authentication_error_has_authentication_status(
     assert failure.value.status_code == 401
     assert failure.value.kind is FailureKind.AUTHENTICATION
     assert auth.recovery_calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "package_version,client_version",
+    [
+        ("6.5.9", "6.5.9"),
+        ("6.5.9.dev0", "6.5.9-dev.0"),
+        ("6.5.9.dev3+gb89b44b2a", "6.5.9-dev.3+gb89b44b2a"),
+        ("6.5.9.dev3+gb89b44b2a.d20260930", "6.5.9-dev.3+gb89b44b2a.d20260930"),
+        ("6.5.9+d20260930", "6.5.9+d20260930"),
+        ("dev", "0.0.0-dev"),
+    ],
+)
+async def test_model_discovery_formats_package_version_for_upstream(
+    monkeypatch: pytest.MonkeyPatch, package_version: str, client_version: str
+) -> None:
+    monkeypatch.setattr(codex_provider_module, "FCC_VERSION", package_version)
+    requests: list[httpx2.Request] = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        requests.append(request)
+        if request.url.params.get("client_version") != client_version:
+            return httpx2.Response(
+                400, json={"detail": "Invalid client_version format"}
+            )
+        return httpx2.Response(
+            200, json={"models": [{"slug": "gpt-visible", "visibility": "list"}]}
+        )
+
+    provider = OpenAICodexProvider(
+        _config(),
+        auth=_FakeAuth(),
+        admission=immediate_admission(max_attempts=1),
+        transport=httpx2.MockTransport(handler),
+    )
+    try:
+        infos = await provider.list_model_infos()
+    finally:
+        await provider.cleanup()
+
+    assert {info.model_id for info in infos} == {"gpt-visible"}
+    assert len(requests) == 1
+    assert requests[0].headers["version"] == package_version
+    assert requests[0].headers["user-agent"] == f"codex_cli_rs/{package_version}"
 
 
 @pytest.mark.asyncio
@@ -596,6 +641,7 @@ async def test_provider_round_trips_portable_tool_name_alias() -> None:
                 "response.output_item.added",
                 {
                     "type": "response.output_item.added",
+                    "output_index": 0,
                     "item": {
                         "type": "function_call",
                         "id": "fc_1",
@@ -608,6 +654,7 @@ async def test_provider_round_trips_portable_tool_name_alias() -> None:
                 "response.output_item.done",
                 {
                     "type": "response.output_item.done",
+                    "output_index": 0,
                     "item": {
                         "type": "function_call",
                         "id": "fc_1",
@@ -1084,7 +1131,7 @@ async def test_final_attempt_unauthorized_preserves_the_provider_401() -> None:
     def handler(request: httpx2.Request) -> httpx2.Response:
         nonlocal attempts
         attempts += 1
-        status = 503 if attempts < 5 else 401
+        status = 503 if attempts < PROVIDER_MAX_ATTEMPTS_DEFAULT else 401
         return httpx2.Response(
             status,
             json={"error": {"message": f"attempt {attempts}"}},
@@ -1106,7 +1153,7 @@ async def test_final_attempt_unauthorized_preserves_the_provider_401() -> None:
             )
         )
 
-    assert attempts == 5
+    assert attempts == PROVIDER_MAX_ATTEMPTS_DEFAULT
     assert auth.recovery_calls == 0
     assert exc_info.value.status_code == 401
     assert "Request ID: req_final_401" in str(exc_info.value)

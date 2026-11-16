@@ -9,7 +9,7 @@ import sqlite3
 import sys
 import threading
 import uuid
-from collections.abc import Iterator
+from collections.abc import Generator
 from contextlib import closing, contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -18,10 +18,12 @@ from typing import Any
 import httpx
 import pytest
 
+from free_claude_code.config.api_keys import first_api_key
 from free_claude_code.config.env_migrations import (
     atomic_write_managed_config,
     settings_env_keys,
 )
+from free_claude_code.config.paths import FCC_DATABASE_FILENAME
 from free_claude_code.config.provider_catalog import PROVIDER_CATALOG
 from smoke.lib.child_process import run_captured_text
 from smoke.lib.config import SmokeConfig
@@ -103,7 +105,7 @@ def _marker_command(marker: Path) -> str:
 def _canned_provider(
     review_release: threading.Event | None = None,
     child_finished: threading.Event | None = None,
-) -> Iterator[tuple[str, dict[str, Any]]]:
+) -> Generator[tuple[str, dict[str, Any]]]:
     state: dict[str, Any] = {"requests": [], "command": None, "reviews": 0}
 
     class Handler(BaseHTTPRequestHandler):
@@ -554,7 +556,11 @@ def test_codex_child_review_local_e2e(
                 )
                 assert marker.read_text().strip() == "smoke"
                 with closing(
-                    sqlite3.connect(tmp_path / "home" / ".fcc" / "code" / "code.db")
+                    sqlite3.connect(
+                        (tmp_path / "home" / ".fcc" / FCC_DATABASE_FILENAME).as_uri()
+                        + "?mode=ro",
+                        uri=True,
+                    )
                 ) as database:
                     root = database.execute(
                         "SELECT native_thread_id FROM code_sessions WHERE id = ?",
@@ -596,7 +602,7 @@ def test_codex_modes_free_provider_e2e(
     )
     descriptor = PROVIDER_CATALOG[provider]
     assert descriptor.credential_attr and descriptor.credential_env
-    key = getattr(smoke_config.settings, descriptor.credential_attr)
+    key = first_api_key(getattr(smoke_config.settings, descriptor.credential_attr))
     if not key:
         pytest.skip("missing_env: OpenRouter key is unavailable")
     env, unset = _environment(tmp_path, model)

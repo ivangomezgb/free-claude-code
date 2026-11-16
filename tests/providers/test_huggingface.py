@@ -17,6 +17,7 @@ from tests.providers.support import (
     immediate_admission,
     make_provider_config,
     profiled_provider,
+    sdk_chat_chunk,
 )
 
 
@@ -29,8 +30,6 @@ def huggingface_config():
     return make_provider_config(
         api_key="test_hf_key",
         base_url=HUGGINGFACE_DEFAULT_BASE,
-        rate_limit=10,
-        rate_window=60,
     )
 
 
@@ -149,7 +148,7 @@ def test_build_request_body_keeps_max_tokens(huggingface_provider):
     mock_convert.assert_called_once()
     assert (
         mock_convert.call_args.kwargs["reasoning_replay"]
-        is ReasoningReplayMode.DISABLED
+        is ReasoningReplayMode.REASONING_CONTENT
     )
     assert body["messages"][0].get("name") == "alice"
     assert body["max_tokens"] == 42
@@ -189,7 +188,7 @@ def test_build_request_body_leaves_reasoning_control_to_selected_upstream(
     assert "extra_body" not in body
 
 
-def test_build_request_body_does_not_replay_prior_thinking_blocks(
+def test_build_request_body_keeps_prior_thinking_in_native_field(
     huggingface_provider,
 ):
     req = make_request(
@@ -210,14 +209,15 @@ def test_build_request_body_does_not_replay_prior_thinking_blocks(
     assert body["messages"] == [
         {
             "role": "assistant",
-            "content": "[Earlier reasoning]\nhidden prior thought\n\nvisible answer",
+            "content": "visible answer",
+            "reasoning_content": "hidden prior thought",
         }
     ]
-    assert "reasoning_content" not in body["messages"][0]
+    assert body["messages"][0]["reasoning_content"] == "hidden prior thought"
     assert "hidden prior thought" in str(body)
 
 
-def test_build_request_body_does_not_replay_top_level_reasoning_content(
+def test_build_request_body_keeps_top_level_reasoning_in_native_field(
     huggingface_provider,
 ):
     req = make_request(
@@ -236,7 +236,8 @@ def test_build_request_body_does_not_replay_top_level_reasoning_content(
     assert body["messages"] == [
         {
             "role": "assistant",
-            "content": "[Earlier reasoning]\nhidden prior reasoning\n\nvisible answer",
+            "content": "visible answer",
+            "reasoning_content": "hidden prior reasoning",
         }
     ]
     assert "hidden prior reasoning" in str(body)
@@ -258,7 +259,7 @@ async def test_stream_messages_text(huggingface_provider):
     mock_chunk.usage = MagicMock(completion_tokens=5, prompt_tokens=10)
 
     async def mock_stream():
-        yield mock_chunk
+        yield sdk_chat_chunk(mock_chunk)
 
     with patch.object(
         huggingface_provider._client.chat.completions, "create", new_callable=AsyncMock
@@ -266,8 +267,9 @@ async def test_stream_messages_text(huggingface_provider):
         mock_create.return_value = SDKStreamDouble(mock_stream())
 
         events = [
-            event
+            frame
             async for event in huggingface_provider.stream_messages(make_request())
+            for frame in event.frames
         ]
 
     assert any(
@@ -292,7 +294,7 @@ async def test_stream_messages_reasoning_content(huggingface_provider):
     mock_chunk.usage = MagicMock(completion_tokens=2, prompt_tokens=10)
 
     async def mock_stream():
-        yield mock_chunk
+        yield sdk_chat_chunk(mock_chunk)
 
     with patch.object(
         huggingface_provider._client.chat.completions, "create", new_callable=AsyncMock
@@ -300,8 +302,9 @@ async def test_stream_messages_reasoning_content(huggingface_provider):
         mock_create.return_value = SDKStreamDouble(mock_stream())
 
         events = [
-            event
+            frame
             async for event in huggingface_provider.stream_messages(make_request())
+            for frame in event.frames
         ]
 
     assert any(

@@ -9,7 +9,6 @@ from free_claude_code.application.errors import InvalidRequestError
 from free_claude_code.config.constants import ANTHROPIC_DEFAULT_MAX_OUTPUT_TOKENS
 from free_claude_code.core.anthropic import ReasoningReplayMode
 from free_claude_code.core.anthropic.models import MessagesRequest
-from free_claude_code.core.history_replay import HistoryScope
 from free_claude_code.core.model_capabilities import ModelInputModality
 from free_claude_code.core.reasoning import ReasoningEffort, ReasoningPolicy
 from free_claude_code.providers.model_listing import (
@@ -97,6 +96,7 @@ class OpenAIModelListing:
     required_null_field: str | None = None
     required_sequence_items: tuple[tuple[str, str], ...] = ()
     exclude_missing_sequence_fields: bool = False
+    optional_sequence_items: tuple[tuple[str, str], ...] = ()
     tags_field: str | None = None
     thinking_tag: str = "reasoning"
     non_thinking_tag: str | None = None
@@ -128,7 +128,6 @@ class OpenAIChatProfile:
         None
     )
     structured_reasoning_details: bool = False
-    history_scope: HistoryScope = HistoryScope.TOOL_CONTINUATION
     user_agent: str | None = None
 
     @property
@@ -139,16 +138,20 @@ class OpenAIChatProfile:
         return openai_v1_base_url(configured) if self.normalize_base_url else configured
 
     def reasoning_delta(self, delta: Any) -> str | None:
+        return self.native_reasoning_delta(delta)[1]
+
+    def native_reasoning_delta(self, delta: Any) -> tuple[str, str | None]:
+        """Return the selected value together with its actual upstream field."""
         value = getattr(delta, self.reasoning_delta_field, None)
         if isinstance(value, str) and value:
-            return value
+            return self.reasoning_delta_field, value
         fallback = self.reasoning_delta_fallback_field
         if fallback is None:
-            return value if isinstance(value, str) else None
+            return self.reasoning_delta_field, value if isinstance(value, str) else None
         fallback_value = getattr(delta, fallback, None)
         if isinstance(fallback_value, str):
-            return fallback_value
-        return value if isinstance(value, str) else None
+            return fallback, fallback_value
+        return self.reasoning_delta_field, value if isinstance(value, str) else None
 
     def apply_reasoning(
         self,
@@ -236,7 +239,7 @@ def _zai_profile(provider_name: str) -> OpenAIChatProfile:
 
 OPENAI_CHAT_PROFILES: dict[str, OpenAIChatProfile] = {
     "cline_pass": OpenAIChatProfile(
-        _policy("CLINE_PASS", ReasoningReplayMode.DISABLED),
+        _policy("CLINE_PASS", ReasoningReplayMode.REASONING),
         NO_REASONING,
         model_listing=OpenAIModelListing(
             path="/ai/cline/recommended-models",
@@ -350,7 +353,7 @@ OPENAI_CHAT_PROFILES: dict[str, OpenAIChatProfile] = {
     "chutes": OpenAIChatProfile(
         _policy(
             "CHUTES",
-            ReasoningReplayMode.DISABLED,
+            ReasoningReplayMode.REASONING_CONTENT,
             default_max_tokens=ANTHROPIC_DEFAULT_MAX_OUTPUT_TOKENS,
         ),
         NO_REASONING,
@@ -402,7 +405,7 @@ OPENAI_CHAT_PROFILES: dict[str, OpenAIChatProfile] = {
     "agnes": OpenAIChatProfile(
         _policy(
             "AGNES",
-            ReasoningReplayMode.THINK_TAGS,
+            ReasoningReplayMode.REASONING_CONTENT,
             include_extra_body=True,
             extra_body_validator=validate_extra_body_does_not_override_reasoning_fields,
             default_max_tokens=ANTHROPIC_DEFAULT_MAX_OUTPUT_TOKENS,
@@ -435,7 +438,7 @@ OPENAI_CHAT_PROFILES: dict[str, OpenAIChatProfile] = {
     "wandb": OpenAIChatProfile(
         _policy(
             "WANDB",
-            ReasoningReplayMode.DISABLED,
+            ReasoningReplayMode.REASONING,
             include_extra_body=True,
             extra_body_validator=validate_extra_body_does_not_override_reasoning_fields,
             default_max_tokens=ANTHROPIC_DEFAULT_MAX_OUTPUT_TOKENS,
@@ -447,7 +450,7 @@ OPENAI_CHAT_PROFILES: dict[str, OpenAIChatProfile] = {
     "azure_openai": OpenAIChatProfile(
         _policy(
             "AZURE_OPENAI",
-            ReasoningReplayMode.THINK_TAGS,
+            ReasoningReplayMode.REASONING_CONTENT,
             max_tokens_field="max_completion_tokens",
         ),
         NamedEffortReasoning(
@@ -458,7 +461,7 @@ OPENAI_CHAT_PROFILES: dict[str, OpenAIChatProfile] = {
         model_ids_are_routable=False,
     ),
     "mistral_codestral": OpenAIChatProfile(
-        _policy("CODESTRAL", ReasoningReplayMode.THINK_TAGS),
+        _policy("CODESTRAL", ReasoningReplayMode.REASONING_CONTENT),
         NO_REASONING,
         model_listing=OpenAIModelListing(
             input_modality_boolean_paths=(
@@ -474,7 +477,7 @@ OPENAI_CHAT_PROFILES: dict[str, OpenAIChatProfile] = {
     "vercel": OpenAIChatProfile(
         _policy(
             "VERCEL",
-            ReasoningReplayMode.THINK_TAGS,
+            ReasoningReplayMode.REASONING_CONTENT,
             include_extra_body=True,
             extra_body_validator=validate_extra_body_does_not_override_reasoning_fields,
         ),
@@ -487,14 +490,14 @@ OPENAI_CHAT_PROFILES: dict[str, OpenAIChatProfile] = {
         ),
     ),
     "bedrock": OpenAIChatProfile(
-        _policy("BEDROCK", ReasoningReplayMode.THINK_TAGS),
+        _policy("BEDROCK", ReasoningReplayMode.REASONING_CONTENT),
         NO_REASONING,
         normalize_base_url=True,
     ),
     "huggingface": OpenAIChatProfile(
         _policy(
             "HUGGINGFACE",
-            ReasoningReplayMode.DISABLED,
+            ReasoningReplayMode.REASONING_CONTENT,
             include_extra_body=True,
             extra_body_validator=validate_extra_body_does_not_override_reasoning_fields,
         ),
@@ -586,7 +589,7 @@ OPENAI_CHAT_PROFILES: dict[str, OpenAIChatProfile] = {
     "cerebras": OpenAIChatProfile(
         _policy(
             "CEREBRAS",
-            ReasoningReplayMode.THINK_TAGS,
+            ReasoningReplayMode.REASONING,
             include_extra_body=True,
             extra_body_validator=validate_extra_body_does_not_override_reasoning_fields,
             max_tokens_field="max_completion_tokens",
@@ -653,7 +656,7 @@ OPENAI_CHAT_PROFILES: dict[str, OpenAIChatProfile] = {
     "nararoute": OpenAIChatProfile(
         _policy(
             "NARAROUTE",
-            ReasoningReplayMode.DISABLED,
+            ReasoningReplayMode.REASONING_CONTENT,
             default_max_tokens=ANTHROPIC_DEFAULT_MAX_OUTPUT_TOKENS,
         ),
         NamedEffortReasoning(
@@ -697,7 +700,7 @@ OPENAI_CHAT_PROFILES: dict[str, OpenAIChatProfile] = {
     "lightning": OpenAIChatProfile(
         _policy(
             "LIGHTNING",
-            ReasoningReplayMode.DISABLED,
+            ReasoningReplayMode.REASONING_CONTENT,
             default_max_tokens=ANTHROPIC_DEFAULT_MAX_OUTPUT_TOKENS,
         ),
         NamedEffortReasoning(
@@ -723,6 +726,99 @@ OPENAI_CHAT_PROFILES: dict[str, OpenAIChatProfile] = {
         ),
         model_listing=OpenAIModelListing(path="/models"),
     ),
+    "cheaperinference": OpenAIChatProfile(
+        _policy(
+            "CHEAPERINFERENCE",
+            ReasoningReplayMode.REASONING_CONTENT,
+            default_max_tokens=ANTHROPIC_DEFAULT_MAX_OUTPUT_TOKENS,
+        ),
+        NamedEffortReasoning(
+            _LOW_MEDIUM_HIGH,
+            enabled_value="medium",
+        ),
+        model_listing=OpenAIModelListing(
+            path="/models",
+            query_params=(("type", "text"), ("streaming", "true")),
+            required_path_values=((("type",), ("text",)),),
+            context_window_tokens_path=("context_length",),
+            max_output_tokens_path=("max_output_tokens",),
+        ),
+    ),
+    "orcarouter": OpenAIChatProfile(
+        _policy(
+            "ORCAROUTER",
+            ReasoningReplayMode.REASONING_CONTENT,
+            default_max_tokens=ANTHROPIC_DEFAULT_MAX_OUTPUT_TOKENS,
+        ),
+        NamedEffortReasoning(_LOW_MEDIUM_HIGH, enabled_value="medium"),
+        model_listing=OpenAIModelListing(
+            path="/models",
+            optional_sequence_items=(("supported_endpoint_types", "openai"),),
+        ),
+    ),
+    # Measured against api.atlascloud.ai/v1 across DeepSeek, GLM, Kimi, Qwen, MiniMax,
+    # OpenAI, Anthropic, Google and xAI models: only ``high`` and ``xhigh`` are
+    # accepted by every model (``none`` is a 400 for glm-5.3, minimax-m2.7 and
+    # gpt-5.5, ``low``/``medium`` for qwen3.5-plus, ``max`` for several), so the
+    # efforts map onto those two and "off" sends no field.
+    "atlascloud": OpenAIChatProfile(
+        _policy(
+            "ATLASCLOUD",
+            ReasoningReplayMode.REASONING_CONTENT,
+            default_max_tokens=ANTHROPIC_DEFAULT_MAX_OUTPUT_TOKENS,
+        ),
+        NamedEffortReasoning(
+            (
+                (ReasoningEffort.MINIMAL, "high"),
+                (ReasoningEffort.LOW, "high"),
+                (ReasoningEffort.MEDIUM, "high"),
+                (ReasoningEffort.HIGH, "high"),
+                (ReasoningEffort.XHIGH, "xhigh"),
+                (ReasoningEffort.MAX, "xhigh"),
+            ),
+            enabled_value="high",
+        ),
+        model_listing=OpenAIModelListing(
+            path="/models",
+            # ``supported_features`` under-reports reasoning (deepseek-v4-flash lists
+            # only tools yet returns reasoning tokens), so thinking is left unknown.
+            input_modalities_path=("input_modalities",),
+            context_window_tokens_path=("context_length",),
+            max_output_tokens_path=("max_output_length",),
+        ),
+    ),
+    "xkiro": OpenAIChatProfile(
+        _policy(
+            "XKIRO",
+            ReasoningReplayMode.REASONING_CONTENT,
+            default_max_tokens=ANTHROPIC_DEFAULT_MAX_OUTPUT_TOKENS,
+        ),
+        NamedEffortReasoning(
+            _ALL_EFFORTS, disabled_value="none", enabled_value="adaptive"
+        ),
+        model_listing=OpenAIModelListing(
+            path="/models",
+            thinking_boolean_path=("capabilities", "reasoning"),
+            fixed_input_modalities=_TEXT_INPUT_MODALITIES,
+            input_modality_boolean_paths=(
+                (ModelInputModality.IMAGE, ("capabilities", "vision")),
+            ),
+            context_window_tokens_path=("context_length",),
+            max_output_tokens_path=("max_output_tokens",),
+        ),
+    ),
+    "opper": OpenAIChatProfile(
+        _policy(
+            "OPPER",
+            ReasoningReplayMode.REASONING_CONTENT,
+            default_max_tokens=ANTHROPIC_DEFAULT_MAX_OUTPUT_TOKENS,
+        ),
+        NamedEffortReasoning(
+            _LOW_MEDIUM_HIGH,
+            enabled_value="medium",
+        ),
+        model_listing=OpenAIModelListing(path="/models"),
+    ),
     "ollama_cloud": OpenAIChatProfile(
         _policy(
             "OLLAMA_CLOUD",
@@ -739,14 +835,14 @@ OPENAI_CHAT_PROFILES: dict[str, OpenAIChatProfile] = {
     "tokenrouter": OpenAIChatProfile(
         _policy(
             "TOKENROUTER",
-            ReasoningReplayMode.DISABLED,
+            ReasoningReplayMode.REASONING_CONTENT,
         ),
         NO_REASONING,
     ),
     "llamacpp": OpenAIChatProfile(
         _policy(
             "LLAMACPP",
-            ReasoningReplayMode.THINK_TAGS,
+            ReasoningReplayMode.REASONING_CONTENT,
             default_max_tokens=ANTHROPIC_DEFAULT_MAX_OUTPUT_TOKENS,
         ),
         LLAMACPP_REASONING,

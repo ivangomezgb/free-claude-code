@@ -31,8 +31,6 @@ def agnes_provider() -> OpenAIChatProvider:
         make_provider_config(
             api_key="test-agnes-key",
             base_url=AGNES_DEFAULT_BASE,
-            rate_limit=10,
-            rate_window=60,
         ),
         admission=immediate_admission(provider_name="agnes"),
     )
@@ -135,7 +133,7 @@ def test_build_request_body_omits_thinking_control_for_provider_default(
     assert "extra_body" not in body
 
 
-def test_build_request_body_replays_reasoning_in_content_not_undocumented_field(
+def test_build_request_body_keeps_readable_reasoning_separate(
     agnes_provider: OpenAIChatProvider,
 ) -> None:
     request = _request(
@@ -160,7 +158,8 @@ def test_build_request_body_replays_reasoning_in_content_not_undocumented_field(
     assistant = body["messages"][1]
     assert assistant == {
         "role": "assistant",
-        "content": "<think>\nWork through it.\n</think>\n\nThe answer is 42.",
+        "content": "The answer is 42.",
+        "reasoning_content": "Work through it.",
     }
 
 
@@ -211,8 +210,6 @@ async def test_model_catalog_uses_documented_endpoint_and_auth() -> None:
             make_provider_config(
                 api_key="wire-agnes-key",
                 base_url=AGNES_DEFAULT_BASE,
-                rate_limit=10,
-                rate_window=60,
             ),
             admission=immediate_admission(provider_name="agnes"),
         )

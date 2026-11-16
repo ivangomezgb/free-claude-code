@@ -13,6 +13,7 @@ from free_claude_code.application.ports import (
 )
 from free_claude_code.cli.launchers.catalog_http import catalog_models_from_response
 from free_claude_code.config.settings import Settings
+from free_claude_code.core.json_types import JsonObject
 from free_claude_code.core.model_capabilities import ModelInputModality
 from free_claude_code.harnesses.codex_model_catalog import build_codex_model_catalog
 from free_claude_code.runtime.codex_app_server import CodexHarnessFactory
@@ -39,8 +40,14 @@ class FakeRequestRuntime(RequestRuntimePort):
         del include_model_infos
         raise AssertionError("Catalog publication must not acquire a provider lease.")
 
-    async def wait_for_catalog(self) -> ModelCatalogSnapshot:
+    def catalog_snapshot(self) -> ModelCatalogSnapshot:
         return ModelCatalogSnapshot(self._settings, self._cached_infos)
+
+    async def wait_for_model_catalog(self, model: str) -> ModelCatalogSnapshot:
+        return self.catalog_snapshot()
+
+    def catalog_status(self) -> JsonObject:
+        raise AssertionError("Catalog publication must not query startup status.")
 
     def current_settings(self) -> Settings:
         return self._settings

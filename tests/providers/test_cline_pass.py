@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, patch
 import httpx2
 import pytest
 from openai import AsyncOpenAI
+from openai.types.chat import ChatCompletionChunk
 
 from free_claude_code.application.model_metadata import ProviderModelInfo
 from free_claude_code.config.provider_catalog import CLINE_DEFAULT_BASE
@@ -30,6 +31,7 @@ from tests.providers.support import (
     immediate_admission,
     make_provider_config,
     profiled_provider,
+    sdk_chat_chunk,
 )
 
 
@@ -40,8 +42,6 @@ def cline_pass_provider() -> OpenAIChatProvider:
         make_provider_config(
             api_key="test-cline-key",
             base_url=CLINE_DEFAULT_BASE,
-            rate_limit=10,
-            rate_window=60,
         ),
         admission=immediate_admission(provider_name="cline_pass"),
     )
@@ -67,8 +67,6 @@ def _provider_with_transport(
             make_provider_config(
                 api_key=api_key,
                 base_url=CLINE_DEFAULT_BASE,
-                rate_limit=10,
-                rate_window=60,
             ),
             admission=immediate_admission(provider_name="cline_pass"),
         )
@@ -84,12 +82,12 @@ def _request(**overrides: JsonValue) -> MessagesRequest:
 
 
 class AsyncStream(SDKStreamDouble):
-    def __init__(self, chunks: list[SimpleNamespace]) -> None:
+    def __init__(self, chunks: list[ChatCompletionChunk]) -> None:
         self._chunks = chunks
         self.closed = False
         super().__init__(self._iter(), close=self.aclose)
 
-    async def _iter(self) -> AsyncIterator[SimpleNamespace]:
+    async def _iter(self) -> AsyncIterator[ChatCompletionChunk]:
         for chunk in self._chunks:
             yield chunk
 
@@ -103,7 +101,7 @@ def _chunk(
     reasoning: str | None = None,
     reasoning_details: list[JsonObject] | None = None,
     finish_reason: str | None = None,
-) -> SimpleNamespace:
+) -> ChatCompletionChunk:
     delta = SimpleNamespace(
         content=content,
         reasoning=reasoning,
@@ -111,7 +109,7 @@ def _chunk(
         tool_calls=None,
     )
     choice = SimpleNamespace(delta=delta, finish_reason=finish_reason)
-    return SimpleNamespace(choices=[choice], usage=None)
+    return sdk_chat_chunk(SimpleNamespace(choices=[choice], usage=None))
 
 
 def test_init_uses_documented_cline_api(
@@ -245,7 +243,7 @@ def test_build_request_body_adds_no_undocumented_reasoning_control_or_default_ca
         assert field not in body
 
 
-def test_build_request_body_replays_only_opaque_reasoning_details(
+def test_build_request_body_preserves_readable_and_native_reasoning(
     cline_pass_provider: OpenAIChatProvider,
 ) -> None:
     detail: JsonObject = {
@@ -278,12 +276,9 @@ def test_build_request_body_replays_only_opaque_reasoning_details(
         message for message in body["messages"] if message["role"] == "assistant"
     )
 
-    assert (
-        assistant["content"]
-        == "[Earlier reasoning]\nNeed a tool.\n\nI will inspect it."
-    )
+    assert assistant["content"] == "I will inspect it."
     assert assistant["reasoning_details"] == [detail]
-    assert "reasoning" not in assistant
+    assert assistant["reasoning"] == "Need a tool."
     assert "reasoning_content" not in assistant
     assert (
         cline_pass_provider._profile.reasoning_delta(
@@ -318,11 +313,12 @@ async def test_stream_uses_upstream_sse_and_preserves_reasoning_details(
     ):
         event_text = "".join(
             [
-                event
+                frame
                 async for event in cline_pass_provider.stream_messages(
                     _request(),
                     reasoning=ReasoningPolicy.on(),
                 )
+                for frame in event.frames
             ]
         )
 
@@ -334,12 +330,13 @@ async def test_stream_uses_upstream_sse_and_preserves_reasoning_details(
     assert thinking_content(events) == "plan "
     assert text_content(events) == "done"
     records = [
-        decode_replay(event.data["delta"]["signature"]).native
+        event.data["delta"]["signature"]
         for event in events
         if event.data.get("delta", {}).get("type") == "signature_delta"
     ]
-    assert len(records) == 1
-    assert records[0]["reasoning_details"] == [detail]
+    assert [decode_replay(record).native for record in records] == [
+        {"reasoning_details": [detail]}
+    ]
     assert stream.closed
 
 

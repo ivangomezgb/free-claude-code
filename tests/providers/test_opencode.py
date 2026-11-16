@@ -16,6 +16,7 @@ from free_claude_code.application.errors import InvalidRequestError
 from free_claude_code.application.execution import ProviderExecutor
 from free_claude_code.application.model_metadata import ProviderModelInfo
 from free_claude_code.application.routing import (
+    ProviderModelCandidate,
     ProviderModelTarget,
     ResolvedModelRoute,
     RoutedMessagesRequest,
@@ -29,6 +30,7 @@ from free_claude_code.core.anthropic.stream_contracts import (
     text_content,
 )
 from free_claude_code.core.failures import ExecutionFailure
+from free_claude_code.core.history_replay import ReplayOrigin, prepare_history
 from free_claude_code.core.model_capabilities import ModelInputModality
 from free_claude_code.core.openai_responses import OpenAIResponsesRequest
 from free_claude_code.core.reasoning import (
@@ -46,11 +48,14 @@ from free_claude_code.providers.opencode.catalog import (
     OpenCodeUpstreamTransport,
     parse_open_code_catalog,
 )
+from tests.api.test_response_streams import _serve
+from tests.api.test_tool_call_buffer import _response
 from tests.providers.support import (
     capture_openai_chat_wire_body,
     immediate_admission,
     make_provider_config,
     reasoning_for,
+    without_empty_reasoning,
 )
 
 
@@ -58,8 +63,6 @@ def _config():
     return make_provider_config(
         api_key="test_opencode_key",
         base_url="https://opencode.ai/zen/v1",
-        rate_limit=100,
-        rate_window=1,
     )
 
 
@@ -280,12 +283,13 @@ def _provider_with_wire_transports(
 async def _collect(provider: OpenCodeProvider, model: str, **overrides: object) -> str:
     return "".join(
         [
-            chunk
+            frame
             async for chunk in provider.stream_messages(
                 _request(model, **overrides),
                 input_tokens=2,
                 request_id="req_opencode",
             )
+            for frame in chunk.frames
         ]
     )
 
@@ -297,12 +301,13 @@ async def _collect_responses(
 ) -> str:
     return "".join(
         [
-            chunk
+            frame
             async for chunk in provider.stream_responses(
                 _responses_request(model, **overrides),
                 input_tokens=2,
                 request_id="req_opencode_responses",
             )
+            for frame in chunk.frames
         ]
     )
 
@@ -722,7 +727,13 @@ async def test_responses_tool_search_accepts_optional_codex_arguments() -> None:
     )
     try:
         await provider.list_model_infos()
-        body = "".join([chunk async for chunk in provider.stream_responses(request)])
+        body = "".join(
+            [
+                frame
+                async for chunk in provider.stream_responses(request)
+                for frame in chunk.frames
+            ]
+        )
     finally:
         await provider.cleanup()
 
@@ -860,7 +871,7 @@ async def test_codex_custom_tool_round_trip_uses_opencode_function_tools() -> No
     first = json.loads(wire_requests[0].content)
     assert first["tools"][0]["type"] == "function"
     assert first["tools"][1] == {"type": "web_search", "external_web_access": False}
-    replay = json.loads(wire_requests[1].content)["input"]
+    replay = without_empty_reasoning(json.loads(wire_requests[1].content)["input"])
     assert replay[0]["type"] == "function_call"
     assert json.loads(replay[0]["arguments"]) == {"input": patch_text}
     assert replay[1] == {
@@ -943,6 +954,7 @@ async def test_discovered_custom_tools_survive_sdk_calls_and_replay(
             assert "namespace" not in tool
             for field in ("allowed_callers", "extension"):
                 assert tool[field] == expected_tool[field]
+        body["input"] = without_empty_reasoning(body["input"])
         if len(body["input"]) > 2:
             assert body["input"][2]["type"] == "function_call"
             assert body["input"][2]["name"] == tool["name"]
@@ -1049,6 +1061,7 @@ async def test_discovered_custom_tools_survive_sdk_calls_and_replay(
     ),
 )
 @pytest.mark.asyncio
+@pytest.mark.parametrize("midstream", [False, True])
 async def test_candidate_fallback_resolves_each_opencode_transport(
     wire_api: str,
     primary_model: str,
@@ -1056,9 +1069,23 @@ async def test_candidate_fallback_resolves_each_opencode_transport(
     failed_path: str,
     fallback_path: str,
     fallback_text: str,
+    midstream: bool,
+    monkeypatch,
 ) -> None:
+    from tests.api.test_delivered_stream_recovery import text_events
+
     def generation_response(request: httpx2.Request) -> httpx2.Response:
         if request.url.path == failed_path:
+            if midstream:
+                protocol = "responses" if failed_path.endswith("/responses") else "chat"
+                return httpx2.Response(
+                    200,
+                    headers={"content-type": "text/event-stream"},
+                    text="".join(
+                        f"data: {json.dumps(event)}\n\n"
+                        for event in text_events(protocol, "Before. ", complete=False)
+                    ),
+                )
             return httpx2.Response(503, json={"error": "temporary overload"})
         if request.url.path == "/zen/v1/responses":
             body = _responses_event_stream(fallback_text)
@@ -1093,12 +1120,11 @@ async def test_candidate_fallback_resolves_each_opencode_transport(
     resolved = ResolvedModelRoute(
         original_model="public-model",
         primary=target(primary_model),
-        fallbacks=(target(fallback_model),),
+        fallbacks=(ProviderModelCandidate(target(fallback_model)),),
         reasoning_preference=ReasoningPreference.INHERIT,
     )
     executor = ProviderExecutor(
-        AsyncMock(side_effect=lambda _provider_id: provider),
-        progress_timeout_seconds=60.0,
+        AsyncMock(side_effect=lambda _provider_id, _api_key_number: provider),
     )
 
     try:
@@ -1109,7 +1135,7 @@ async def test_candidate_fallback_resolves_each_opencode_transport(
                     resolved=resolved,
                     reasoning=DEFAULT_REASONING_POLICY,
                 ),
-                raw_log_payload={},
+                raw_log_payload=dict,
                 request_id="req_opencode_cross_transport_responses",
             )
         else:
@@ -1119,10 +1145,15 @@ async def test_candidate_fallback_resolves_each_opencode_transport(
                     resolved=resolved,
                     reasoning=DEFAULT_REASONING_POLICY,
                 ),
-                raw_log_payload={},
+                raw_log_payload=dict,
                 request_id="req_opencode_cross_transport_messages",
             )
-        body = "".join([chunk async for chunk in stream])
+        if midstream:
+            response = await _response(wire_api, stream)
+            messages = await _serve(response)
+            body = b"".join(message.get("body", b"") for message in messages).decode()
+        else:
+            body = "".join([frame async for chunk in stream for frame in chunk.frames])
     finally:
         await provider.cleanup()
 
@@ -1133,6 +1164,9 @@ async def test_candidate_fallback_resolves_each_opencode_transport(
         fallback_path,
     ]
     payloads = [json.loads(request.content) for request in generation_requests]
+    if midstream:
+        history = payloads[-1].get("messages", payloads[-1].get("input"))
+        assert "Before. " in str(history[-2])
     assert [payload["model"] for payload in payloads] == [
         upstream_id(primary_model),
         upstream_id(primary_model),
@@ -1143,15 +1177,18 @@ async def test_candidate_fallback_resolves_each_opencode_transport(
         assert [event.event for event in events].count("response.created") == 1
         assert [event.event for event in events].count("response.completed") == 1
         assert events[-1].data["response"]["model"] == "public-model"
-        assert [
-            event.data["delta"]
-            for event in events
-            if event.event == "response.output_text.delta"
-        ] == [fallback_text]
+        assert (
+            "".join(
+                event.data["delta"]
+                for event in events
+                if event.event == "response.output_text.delta"
+            )
+            == ("Before. " if midstream else "") + fallback_text
+        )
     else:
         assert_anthropic_stream_contract(events)
         assert events[0].data["message"]["model"] == "public-model"
-        assert text_content(events) == fallback_text
+        assert text_content(events) == ("Before. " if midstream else "") + fallback_text
     assert "temporary overload" not in body
 
 
@@ -1356,7 +1393,12 @@ async def test_tool_only_history_sends_empty_reasoning_content_on_wire(
     )
 
     body = provider._chat._build_request_body(request, reasoning=reasoning_for(request))
-    wire = await capture_openai_chat_wire_body(body)
+    wire = await capture_openai_chat_wire_body(
+        prepare_history(
+            body,
+            ReplayOrigin(provider._opencode_profile.provider_name, "chat", "", "", "m"),
+        )
+    )
 
     assistant = wire["messages"][0]
     assert assistant["content"] == ""

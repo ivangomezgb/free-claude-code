@@ -32,8 +32,6 @@ def chutes_provider() -> OpenAIChatProvider:
         make_provider_config(
             api_key="test-chutes-key",
             base_url=CHUTES_DEFAULT_BASE,
-            rate_limit=10,
-            rate_window=60,
         ),
         admission=immediate_admission(provider_name="chutes"),
     )
@@ -73,7 +71,7 @@ def test_preserves_upstream_reasoning_default(
     assert "extra_body" not in body
 
 
-def test_does_not_replay_reasoning_but_preserves_tool_history(
+def test_keeps_reasoning_separate_and_preserves_tool_history(
     chutes_provider: OpenAIChatProvider,
 ) -> None:
     request = MessagesRequest.model_validate(
@@ -114,12 +112,9 @@ def test_does_not_replay_reasoning_but_preserves_tool_history(
     )
 
     assistant = body["messages"][1]
-    assert (
-        assistant["content"]
-        == "[Earlier reasoning]\nRead it first.\n\nI will inspect it."
-    )
+    assert assistant["content"] == "I will inspect it."
     assert assistant["tool_calls"][0]["id"] == "toolu_1"
-    assert "reasoning_content" not in assistant
+    assert assistant["reasoning_content"] == "Read it first."
     assert "reasoning" not in assistant
     assert body["messages"][2] == {
         "role": "tool",

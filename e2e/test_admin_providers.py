@@ -3,7 +3,7 @@
 import pytest
 from playwright.sync_api import ConsoleMessage, Page, Route, ViewportSize, expect
 
-from e2e.provider_support import close_provider, open_provider
+from e2e.provider_support import api_key_input, close_provider, open_provider
 
 
 @pytest.mark.parametrize(
@@ -20,11 +20,11 @@ def test_retired_provider_is_absent_and_default_setup_remains_available(
         "primary-button"
     )
     card.locator("[data-provider-settings]").click()
-    expect(page.locator("#field-NVIDIA_NIM_API_KEY")).to_be_focused()
+    expect(page.get_by_role("button", name="Add key", exact=True)).to_be_focused()
     close_provider(page)
     page.get_by_role("button", name="Model Config", exact=True).click()
     expect(page.locator("#field-MODEL")).to_have_value(
-        "nvidia_nim/nvidia/nemotron-3-super-120b-a12b"
+        "nvidia_nim/nvidia/nemotron-3-ultra-550b-a55b"
     )
 
 
@@ -54,7 +54,7 @@ def test_missing_provider_configuration_opens_modal_and_focuses_exact_field(
 ) -> None:
     _open_admin(page, admin_base_url, viewport)
     card = page.locator('[data-provider="nvidia_nim"]')
-    key_input = page.locator("#field-NVIDIA_NIM_API_KEY")
+    key_input = page.get_by_role("button", name="Add key", exact=True)
 
     expect(card.get_by_role("button", name="Configure", exact=True)).to_have_class(
         "primary-button"
@@ -166,15 +166,26 @@ def test_delayed_startup_status_does_not_replace_a_manual_provider_check(
     snapshot = page.request.get(f"{admin_base_url}/admin/api/status").json()
     startup: list[Route] = []
     manual: list[Route] = []
-    page.route("**/admin/api/status", lambda route: startup.append(route))
-    page.route(
-        "**/admin/api/providers/open_router/test", lambda route: manual.append(route)
-    )
-    with page.expect_request("**/admin/api/status"):
-        page.evaluate("void refreshStartup()")
+
+    def hold_first_status(route: Route) -> None:
+        # Only the stale snapshot is held. Later refreshes must finish normally.
+        if startup:
+            route.continue_()
+        else:
+            startup.append(route)
+            page.evaluate("window.startupRequests = (window.startupRequests || 0) + 1")
+
+    def hold_manual(route: Route) -> None:
+        manual.append(route)
+        page.evaluate("window.manualRequests = (window.manualRequests || 0) + 1")
+
+    page.route("**/admin/api/status", hold_first_status)
+    page.route("**/admin/api/providers/open_router/test", hold_manual)
+    page.evaluate("void refreshStartup()")
+    page.wait_for_function("window.startupRequests >= 1")
     dialog = open_provider(page, "open_router")
-    with page.expect_request("**/admin/api/providers/open_router/test"):
-        dialog.get_by_role("button", name="Refresh models", exact=True).click()
+    dialog.get_by_role("button", name="Refresh models", exact=True).click()
+    page.wait_for_function("window.manualRequests >= 1")
     expected = "Checking..."
     if manual_result != "pending":
         manual.pop().fulfill(
@@ -192,7 +203,7 @@ def test_delayed_startup_status_does_not_replace_a_manual_provider_check(
     result = page.locator('[data-provider-check-result="open_router"]')
     expect(result).to_have_text(expected)
     with page.expect_response("**/admin/api/status") as response:
-        startup.pop(0).fulfill(json=snapshot)
+        startup[0].fulfill(json=snapshot)
     response.value.finished()
     page.wait_for_function("!state.startupRequest")
     expect(result).to_have_text(expected)
@@ -203,30 +214,73 @@ def test_delayed_startup_status_does_not_replace_a_manual_provider_check(
 
 
 @pytest.mark.parametrize("availability_first", [False, True])
+@pytest.mark.parametrize("discovery", ["starting", "ready", "failed"])
+@pytest.mark.parametrize("available", [False, True])
 def test_local_model_discovery_takes_precedence_over_reachability(
-    page: Page, admin_base_url: str, availability_first: bool
+    page: Page,
+    admin_base_url: str,
+    availability_first: bool,
+    discovery: str,
+    available: bool,
 ) -> None:
     startup: list[Route] = []
     availability: list[Route] = []
-    page.route("**/admin/api/status", lambda route: startup.append(route))
+
+    def status(route: Route) -> None:
+        if startup:
+            route.fulfill(json=snapshot)
+        else:
+            startup.append(route)
+
+    page.route("**/admin/api/status", status)
     page.route(
-        "**/admin/api/providers/local-status", lambda route: availability.append(route)
+        "**/admin/api/providers/lmstudio/local-status",
+        lambda route: availability.append(route),
     )
     _open_admin(page, admin_base_url, {"width": 1280, "height": 720})
     page.wait_for_function("!!state.startupRequest && !!state.localStatusRequest")
     snapshot = page.request.get(f"{admin_base_url}/admin/api/status").json()
-    snapshot["startup"]["providers"]["lmstudio"] = "ready"
+    snapshot["startup"]["providers"]["lmstudio"] = discovery
     snapshot["cached_models"]["lmstudio"] = ["local-model"]
+    primary = {
+        "starting": "Checking models…",
+        "ready": "1 model available",
+        "failed": "Could not load models. Check the provider's settings and retry.",
+    }[discovery]
+    probe = {
+        "status": "reachable" if available else "offline",
+        "base_url": "http://localhost:1234/v1",
+        "status_code": 200 if available else 503,
+        "probe_path": "/models",
+        "latency_ms": 12.5,
+    }
+    diagnostic = (
+        "Reachable: http://localhost:1234/v1"
+        if available
+        else "Unavailable: http://localhost:1234/v1 returned HTTP 503"
+    ) + " (GET /models, 12.5 ms)"
     result = page.locator('[data-provider-check-result="lmstudio"]')
+    detail = page.locator('[data-provider-availability-result="lmstudio"]')
+    dialog = open_provider(page, "lmstudio")
     if availability_first:
-        availability.pop().continue_()
-        expect(result).to_have_text("Reachable: http://localhost:1234/v1")
-    startup.pop(0).fulfill(json=snapshot)
-    expect(result).to_have_text("1 model available")
+        availability.pop().fulfill(json=probe)
+        expect(result).to_have_text(diagnostic)
+        expect(detail).to_be_hidden()
+    startup[0].fulfill(json=snapshot)
+    expect(result).to_have_text(primary)
     if not availability_first:
-        availability.pop().continue_()
+        availability.pop().fulfill(json=probe)
         page.wait_for_function("!state.localStatusRequest")
-        expect(result).to_have_text("1 model available")
+    expect(result).to_have_text(primary)
+    expect(detail).to_have_text(diagnostic)
+    expect(detail).to_have_class(
+        "provider-availability-result " + ("ok" if available else "error")
+    )
+    expect(dialog.locator("#providerDialogCheck")).to_have_text(primary)
+    expect(dialog.locator("#providerDialogAvailability")).to_have_text(diagnostic)
+    if discovery == "starting":
+        with page.expect_response("**/admin/api/status"):
+            page.evaluate("void refreshStartup()")
 
 
 def test_provider_check_failure_is_separate_and_never_exposes_exception_text(
@@ -251,8 +305,7 @@ def test_provider_check_failure_is_separate_and_never_exposes_exception_text(
 
     result = card.locator(".provider-check-result")
     expect(result).to_have_text(
-        "Unavailable: Could not refresh this provider's models. "
-        "Verify its configuration and access."
+        "Unavailable: Could not load models. Check the provider's settings and retry."
     )
     expect(card.get_by_role("button", name="Edit", exact=True)).to_have_class(
         "secondary-button"
@@ -287,29 +340,34 @@ def test_admin_loading_finishes_before_local_availability_checks(
     page: Page, admin_base_url: str
 ) -> None:
     pending: list[Route] = []
-    page.route(
-        "**/admin/api/providers/local-status", lambda route: pending.append(route)
-    )
+
+    def hold(route):
+        pending.append(route)
+        page.evaluate("window.localChecks = (window.localChecks || 0) + 1")
+
+    page.route("**/admin/api/providers/*/local-status", hold)
     _open_admin(page, admin_base_url, {"width": 1280, "height": 720})
     open_provider(page, "nvidia_nim")
-    key = page.locator("#field-NVIDIA_NIM_API_KEY")
+    key = api_key_input(page, "NVIDIA_NIM_API_KEY")
     key.fill("unsaved-key")
     expect(page.locator("#dirtyState")).to_have_text("No changes")
     expect(page.locator("#saveProvider")).to_be_enabled()
 
-    route = pending.pop()
-    payload = route.fetch().json()
-    providers = {provider["provider_id"]: provider for provider in payload["providers"]}
-    providers["llamacpp"].update(status="offline", label="Offline", status_code=503)
-    providers["ollama"].update(status="missing_url", label="Missing URL", base_url="")
-    route.fulfill(json=payload)
-    expect(page.locator('[data-provider-check-result="lmstudio"]')).to_have_text(
+    page.wait_for_function("window.localChecks === 3")
+    for route in pending:
+        payload = route.fetch().json()
+        if payload["provider_id"] == "llamacpp":
+            payload.update(status="offline", label="Offline", status_code=503)
+        elif payload["provider_id"] == "ollama":
+            payload.update(status="missing_url", label="Missing URL", base_url="")
+        route.fulfill(json=payload)
+    expect(page.locator('[data-provider-availability-result="lmstudio"]')).to_have_text(
         "Reachable: http://localhost:1234/v1"
     )
-    expect(page.locator('[data-provider-check-result="llamacpp"]')).to_have_text(
+    expect(page.locator('[data-provider-availability-result="llamacpp"]')).to_have_text(
         "Unavailable: http://localhost:8080/v1 returned HTTP 503"
     )
-    expect(page.locator('[data-provider-check-result="ollama"]')).to_be_hidden()
+    expect(page.locator('[data-provider-availability-result="ollama"]')).to_be_hidden()
     expect(
         page.locator('[data-provider="lmstudio"]').get_by_role(
             "button", name="Edit", exact=True
@@ -328,12 +386,13 @@ def test_local_availability_failure_does_not_fail_admin_loading(
     errors: list[str] = []
     page.on("pageerror", lambda error: errors.append(str(error)))
     page.route(
-        "**/admin/api/providers/local-status", lambda route: pending.append(route)
+        "**/admin/api/providers/lmstudio/local-status",
+        lambda route: pending.append(route),
     )
-    with page.expect_request("**/admin/api/providers/local-status"):
+    with page.expect_request("**/admin/api/providers/lmstudio/local-status"):
         page.goto(f"{admin_base_url}/admin")
     open_provider(page, "nvidia_nim")
-    expect(page.locator("#field-NVIDIA_NIM_API_KEY")).to_be_editable()
+    expect(api_key_input(page, "NVIDIA_NIM_API_KEY")).to_be_editable()
     close_provider(page)
     if failure == "http":
         pending.pop().fulfill(status=503, json={"detail": "private-diagnostic-marker"})
@@ -342,9 +401,14 @@ def test_local_availability_failure_does_not_fail_admin_loading(
 
     for provider_id in ("lmstudio", "llamacpp", "ollama"):
         card = page.locator(f'[data-provider="{provider_id}"]')
-        expect(card.locator(".provider-check-result")).to_have_text(
-            "Availability check failed. Use Test to retry."
-        )
+        if provider_id == "lmstudio":
+            expect(card.locator(".provider-availability-result")).to_have_text(
+                "Availability check failed. Use Test to retry."
+            )
+        else:
+            expect(card.locator(".provider-availability-result")).to_contain_text(
+                "Reachable:"
+            )
         expect(card.get_by_role("button", name="Edit", exact=True)).to_have_class(
             "secondary-button"
         )
@@ -359,6 +423,74 @@ def test_local_availability_failure_does_not_fail_admin_loading(
     assert errors == []
 
 
+@pytest.mark.parametrize(
+    "viewport",
+    ({"width": 1280, "height": 720}, {"width": 390, "height": 844}),
+)
+def test_local_provider_diagnostics_are_visible_on_cards_and_in_the_dialog(
+    page: Page, admin_base_url: str, viewport: ViewportSize
+) -> None:
+    errors: list[str] = []
+    page.on("pageerror", lambda error: errors.append(str(error)))
+    timeout_message = (
+        "The local provider availability check timed out. "
+        "Check that its server is responsive and retry."
+    )
+    results = {
+        "lmstudio": {
+            "provider_id": "lmstudio",
+            "status": "reachable",
+            "base_url": "http://localhost:1234/v1",
+            "probe_path": "/models",
+            "latency_ms": 12.5,
+            "error_type": None,
+        },
+        "llamacpp": {
+            "provider_id": "llamacpp",
+            "status": "offline",
+            "base_url": "http://localhost:8080/v1",
+            "status_code": 503,
+            "probe_path": "/models",
+            "latency_ms": 8,
+            "error_type": "http_error",
+        },
+        "ollama": {
+            "provider_id": "ollama",
+            "status": "offline",
+            "base_url": "http://localhost:11434",
+            "message": timeout_message,
+            "probe_path": "/api/tags",
+            "latency_ms": 1500,
+            "error_type": "timeout",
+            "private_diagnostic": "private-credential-marker",
+        },
+    }
+
+    def reply(route: Route) -> None:
+        provider_id = route.request.url.split("/")[-2]
+        route.fulfill(json=results[provider_id])
+
+    page.route("**/admin/api/providers/*/local-status", reply)
+    _open_admin(page, admin_base_url, viewport)
+
+    expect(page.locator('[data-provider-availability-result="lmstudio"]')).to_have_text(
+        "Reachable: http://localhost:1234/v1 (GET /models, 12.5 ms)"
+    )
+    expect(page.locator('[data-provider-availability-result="llamacpp"]')).to_have_text(
+        "Unavailable: http://localhost:8080/v1 returned HTTP 503 (GET /models, 8 ms)"
+    )
+    expected_timeout = f"Unavailable: {timeout_message} (GET /api/tags, 1500 ms)"
+    expect(page.locator('[data-provider-availability-result="ollama"]')).to_have_text(
+        expected_timeout
+    )
+    dialog = open_provider(page, "ollama")
+    expect(dialog.locator("#providerDialogAvailability")).to_have_text(expected_timeout)
+    expect(dialog.locator("#providerDialogAvailability")).to_be_in_viewport()
+    expect(dialog.get_by_role("button", name="Test", exact=True)).to_be_enabled()
+    assert "private-credential-marker" not in page.locator("body").inner_text()
+    assert errors == []
+
+
 @pytest.mark.parametrize("manual_finished", [False, True])
 def test_manual_provider_test_takes_precedence_over_automatic_availability(
     page: Page, admin_base_url: str, manual_finished: bool
@@ -366,7 +498,8 @@ def test_manual_provider_test_takes_precedence_over_automatic_availability(
     availability: list[Route] = []
     manual: list[Route] = []
     page.route(
-        "**/admin/api/providers/local-status", lambda route: availability.append(route)
+        "**/admin/api/providers/lmstudio/local-status",
+        lambda route: availability.append(route),
     )
     page.route(
         "**/admin/api/providers/lmstudio/test", lambda route: manual.append(route)
@@ -390,19 +523,21 @@ def test_manual_provider_test_takes_precedence_over_automatic_availability(
             "Unavailable: Could not refresh this provider's models."
         )
 
-    with page.expect_response("**/admin/api/providers/local-status") as response:
+    with page.expect_response(
+        "**/admin/api/providers/lmstudio/local-status"
+    ) as response:
         if manual_finished:
             availability.pop().fulfill(status=503, json={"detail": "Check failed"})
         else:
             availability.pop().continue_()
     response.value.finished()
     page.evaluate("() => new Promise(requestAnimationFrame)")
-    other = page.locator('[data-provider-check-result="ollama"]')
+    other = page.locator('[data-provider-availability-result="ollama"]')
     if manual_finished:
         expect(result).to_have_text(
             "Unavailable: Could not refresh this provider's models."
         )
-        expect(other).to_have_text("Availability check failed. Use Test to retry.")
+        expect(other).to_have_text("Reachable: http://localhost:11434")
     else:
         expect(result).to_have_text("Checking...")
         expect(other).to_have_text("Reachable: http://localhost:11434")
@@ -411,3 +546,56 @@ def test_manual_provider_test_takes_precedence_over_automatic_availability(
         )
         expect(result).to_have_text("1 model available")
     expect(dialog.get_by_role("button", name="Test", exact=True)).to_be_enabled()
+
+
+def test_xkiro_uses_standard_provider_configuration(page: Page, admin_base_url: str):
+    _open_admin(page, admin_base_url, {"width": 1280, "height": 720})
+    card = page.locator('[data-provider="xkiro"]')
+    expect(card.get_by_role("button", name="Configure", exact=True)).to_be_visible()
+    expect(card.locator('a[href="https://xkiro.com/"]')).to_be_visible()
+    dialog = open_provider(page, "xkiro")
+    expect(dialog.get_by_role("button", name="Add key", exact=True)).to_be_focused()
+    expect(api_key_input(page, "XKIRO_API_KEY")).to_have_attribute("type", "password")
+    expect(dialog.locator("#field-XKIRO_PROXY")).to_be_visible()
+    expect(dialog).to_contain_text("xkiro.com/dashboard/api/keys")
+    close_provider(page)
+
+
+def test_anthropic_standard_modal_groups_key_workspace_and_proxy(
+    page: Page, admin_base_url: str
+):
+    submissions = []
+
+    def save(route: Route):
+        submissions.append(route.request.post_data_json)
+        route.fulfill(
+            json={
+                "applied": True,
+                "credential_checks": [],
+                "restart": {"required": False},
+            }
+        )
+
+    page.route("**/admin/api/config/apply", save)
+    _open_admin(page, admin_base_url, {"width": 1280, "height": 720})
+    card = page.locator('[data-provider="anthropic"]')
+    expect(card.get_by_role("button", name="Configure", exact=True)).to_be_visible()
+    dialog = open_provider(page, "anthropic")
+    key = api_key_input(page, "ANTHROPIC_API_KEY")
+    expect(key).to_have_attribute("type", "password")
+    expect(key).to_be_focused()
+    expect(dialog.locator("#field-ANTHROPIC_WORKSPACE_ID")).to_be_visible()
+    expect(dialog.locator("#field-ANTHROPIC_PROXY")).to_be_visible()
+    key.fill("test-api-key")
+    dialog.locator("#field-ANTHROPIC_WORKSPACE_ID").fill("wrkspc_test")
+    dialog.get_by_role("button", name="Save", exact=True).click()
+    expect(dialog).not_to_be_visible()
+    assert len(submissions) == 1
+    assert set(submissions[0]["values"]) == {
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_WORKSPACE_ID",
+    }
+    assert submissions[0]["values"]["ANTHROPIC_API_KEY"]["entries"] == [
+        {"value": "test-api-key"}
+    ]
+    assert submissions[0]["values"]["ANTHROPIC_WORKSPACE_ID"] == "wrkspc_test"
